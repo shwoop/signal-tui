@@ -6138,25 +6138,23 @@ mod tests {
     }
 
     #[rstest]
-    #[case("next_conversation")]
-    #[case("part_command")]
-    fn clears_attachment_on_navigation(mut app: App, #[case] method: &str) {
+    fn clears_attachment_on_next_conversation(mut app: App) {
         app.get_or_create_conversation("+1", "Alice", false);
         app.active_conversation = Some("+1".to_string());
         app.pending_attachment = Some(std::path::PathBuf::from("/tmp/photo.jpg"));
+        app.get_or_create_conversation("+2", "Bob", false);
+        app.next_conversation();
+        assert!(app.pending_attachment.is_none());
+    }
 
-        match method {
-            "next_conversation" => {
-                app.get_or_create_conversation("+2", "Bob", false);
-                app.next_conversation();
-            }
-            "part_command" => {
-                app.input_buffer = "/part".to_string();
-                app.input_cursor = 5;
-                app.handle_input();
-            }
-            _ => unreachable!(),
-        }
+    #[rstest]
+    fn clears_attachment_on_part_command(mut app: App) {
+        app.get_or_create_conversation("+1", "Alice", false);
+        app.active_conversation = Some("+1".to_string());
+        app.pending_attachment = Some(std::path::PathBuf::from("/tmp/photo.jpg"));
+        app.input_buffer = "/part".to_string();
+        app.input_cursor = 5;
+        app.handle_input();
         assert!(app.pending_attachment.is_none());
     }
 
@@ -6448,32 +6446,29 @@ mod tests {
     }
 
     #[rstest]
-    #[case("in_group", 5, "Members", "Leave")]
-    #[case("not_group", 1, "Create group", "Create group")]
-    #[case("no_conv", 1, "Create group", "Create group")]
-    fn group_menu_items_context(
-        mut app: App,
-        #[case] context: &str,
-        #[case] expected_len: usize,
-        #[case] first_label: &str,
-        #[case] last_label: &str,
-    ) {
-        match context {
-            "in_group" => {
-                app.get_or_create_conversation("g1", "Family", true);
-                app.active_conversation = Some("g1".to_string());
-            }
-            "not_group" => {
-                app.get_or_create_conversation("+1", "Alice", false);
-                app.active_conversation = Some("+1".to_string());
-            }
-            "no_conv" => {}
-            _ => unreachable!(),
-        }
+    fn group_menu_items_in_group(mut app: App) {
+        app.get_or_create_conversation("g1", "Family", true);
+        app.active_conversation = Some("g1".to_string());
         let items = app.group_menu_items();
-        assert_eq!(items.len(), expected_len);
-        assert_eq!(items[0].label, first_label);
-        assert_eq!(items[items.len() - 1].label, last_label);
+        assert_eq!(items.len(), 5);
+        assert_eq!(items[0].label, "Members");
+        assert_eq!(items[items.len() - 1].label, "Leave");
+    }
+
+    #[rstest]
+    fn group_menu_items_not_in_group(mut app: App) {
+        app.get_or_create_conversation("+1", "Alice", false);
+        app.active_conversation = Some("+1".to_string());
+        let items = app.group_menu_items();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label, "Create group");
+    }
+
+    #[rstest]
+    fn group_menu_items_no_conversation(mut app: App) {
+        let items = app.group_menu_items();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label, "Create group");
     }
 
     #[rstest]
@@ -6625,20 +6620,16 @@ mod tests {
     }
 
     #[rstest]
-    #[case("unknown_sender", false)]
-    #[case("known_contact", true)]
-    fn conversation_acceptance(mut app: App, #[case] scenario: &str, #[case] expected_accepted: bool) {
-        match scenario {
-            "unknown_sender" => {
-                app.handle_signal_event(SignalEvent::MessageReceived(msg_from("+1")));
-            }
-            "known_contact" => {
-                app.contact_names.insert("+1".to_string(), "Alice".to_string());
-                app.handle_signal_event(SignalEvent::MessageReceived(msg_from("+1")));
-            }
-            _ => unreachable!(),
-        }
-        assert_eq!(app.conversations["+1"].accepted, expected_accepted);
+    fn unknown_sender_creates_unaccepted_conversation(mut app: App) {
+        app.handle_signal_event(SignalEvent::MessageReceived(msg_from("+1")));
+        assert!(!app.conversations["+1"].accepted);
+    }
+
+    #[rstest]
+    fn known_contact_creates_accepted_conversation(mut app: App) {
+        app.contact_names.insert("+1".to_string(), "Alice".to_string());
+        app.handle_signal_event(SignalEvent::MessageReceived(msg_from("+1")));
+        assert!(app.conversations["+1"].accepted);
     }
 
     #[rstest]
@@ -6726,45 +6717,39 @@ mod tests {
     }
 
     #[rstest]
-    #[case("unaccepted")]
-    #[case("blocked")]
-    fn bell_skipped_for_filtered_conversations(mut app: App, #[case] filter_type: &str) {
-        match filter_type {
-            "unaccepted" => {
-                app.handle_signal_event(SignalEvent::MessageReceived(msg_from("+1")));
-            }
-            "blocked" => {
-                app.get_or_create_conversation("+1", "Alice", false);
-                if let Some(conv) = app.conversations.get_mut("+1") {
-                    conv.accepted = true;
-                }
-                app.blocked_conversations.insert("+1".to_string());
-                app.handle_signal_event(SignalEvent::MessageReceived(msg_from("+1")));
-            }
-            _ => unreachable!(),
-        }
+    fn bell_skipped_for_unaccepted_conversation(mut app: App) {
+        app.handle_signal_event(SignalEvent::MessageReceived(msg_from("+1")));
         assert!(!app.pending_bell);
     }
 
     #[rstest]
-    #[case("unaccepted")]
-    #[case("blocked")]
-    fn read_receipts_not_sent_for_filtered(mut app: App, #[case] filter_type: &str) {
-        app.send_read_receipts = true;
-        match filter_type {
-            "unaccepted" => {
-                app.handle_signal_event(SignalEvent::MessageReceived(msg_from("+1")));
-            }
-            "blocked" => {
-                app.get_or_create_conversation("+1", "Alice", false);
-                if let Some(conv) = app.conversations.get_mut("+1") {
-                    conv.accepted = true;
-                }
-                app.blocked_conversations.insert("+1".to_string());
-                app.handle_signal_event(SignalEvent::MessageReceived(msg_from("+1")));
-            }
-            _ => unreachable!(),
+    fn bell_skipped_for_blocked_conversation(mut app: App) {
+        app.get_or_create_conversation("+1", "Alice", false);
+        if let Some(conv) = app.conversations.get_mut("+1") {
+            conv.accepted = true;
         }
+        app.blocked_conversations.insert("+1".to_string());
+        app.handle_signal_event(SignalEvent::MessageReceived(msg_from("+1")));
+        assert!(!app.pending_bell);
+    }
+
+    #[rstest]
+    fn read_receipts_not_sent_for_unaccepted(mut app: App) {
+        app.send_read_receipts = true;
+        app.handle_signal_event(SignalEvent::MessageReceived(msg_from("+1")));
+        app.queue_read_receipts_for_conv("+1", 0);
+        assert!(app.pending_read_receipts.is_empty());
+    }
+
+    #[rstest]
+    fn read_receipts_not_sent_for_blocked(mut app: App) {
+        app.send_read_receipts = true;
+        app.get_or_create_conversation("+1", "Alice", false);
+        if let Some(conv) = app.conversations.get_mut("+1") {
+            conv.accepted = true;
+        }
+        app.blocked_conversations.insert("+1".to_string());
+        app.handle_signal_event(SignalEvent::MessageReceived(msg_from("+1")));
         app.queue_read_receipts_for_conv("+1", 0);
         assert!(app.pending_read_receipts.is_empty());
     }
