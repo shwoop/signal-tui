@@ -26,7 +26,7 @@ pub const COMMANDS: &[CommandInfo] = &[
 ];
 
 /// Parsed user input — either a command or plain text to send
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum InputAction {
     /// Send text to the current conversation
     SendText(String),
