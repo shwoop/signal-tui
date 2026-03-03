@@ -2480,13 +2480,19 @@ impl App {
                 self.handle_remote_delete(&conv_id, target_timestamp);
             }
             SignalEvent::PinReceived {
-                conv_id, sender, target_author: _, target_timestamp,
+                conv_id, sender, sender_name, target_author: _, target_timestamp,
             } => {
+                if let Some(ref name) = sender_name {
+                    self.contact_names.entry(sender.clone()).or_insert_with(|| name.clone());
+                }
                 self.handle_pin_received(&conv_id, &sender, target_timestamp, true);
             }
             SignalEvent::UnpinReceived {
-                conv_id, sender, target_author: _, target_timestamp,
+                conv_id, sender, sender_name, target_author: _, target_timestamp,
             } => {
+                if let Some(ref name) = sender_name {
+                    self.contact_names.entry(sender.clone()).or_insert_with(|| name.clone());
+                }
                 self.handle_pin_received(&conv_id, &sender, target_timestamp, false);
             }
             SignalEvent::SystemMessage { conv_id, body, timestamp, timestamp_ms } => {
@@ -3004,10 +3010,14 @@ impl App {
             self.db.set_message_pinned(conv_id, target_timestamp, pinned),
             "set_message_pinned",
         );
-        // Insert system message
-        let sender_name = self.contact_names.get(sender).cloned().unwrap_or_else(|| sender.to_string());
+        // Insert system message — resolve sender to display name
+        let sender_display = if sender == self.account {
+            "you".to_string()
+        } else {
+            self.contact_names.get(sender).cloned().unwrap_or_else(|| sender.to_string())
+        };
         let action = if pinned { "pinned" } else { "unpinned" };
-        let body = format!("{sender_name} {action} a message");
+        let body = format!("{sender_display} {action} a message");
         let now = Utc::now();
         let now_ms = now.timestamp_millis();
         self.handle_system_message(conv_id, &body, now, now_ms);

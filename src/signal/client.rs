@@ -353,7 +353,7 @@ impl SignalClient {
 
         let params = if is_group {
             serde_json::json!({
-                "groupId": recipient,
+                "groupId": [recipient],
                 "targetAuthor": target_author,
                 "targetTimestamp": target_timestamp,
                 "account": self.account,
@@ -397,7 +397,7 @@ impl SignalClient {
 
         let params = if is_group {
             serde_json::json!({
-                "groupId": recipient,
+                "groupId": [recipient],
                 "targetAuthor": target_author,
                 "targetTimestamp": target_timestamp,
                 "account": self.account,
@@ -1177,6 +1177,11 @@ fn parse_data_message(
             .and_then(|v| v.as_str())
             .unwrap_or("unknown")
             .to_string();
+        let sender_name = envelope
+            .get("sourceName")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
         let group_id = data
             .get("groupInfo")
             .and_then(|g| g.get("groupId"))
@@ -1187,6 +1192,7 @@ fn parse_data_message(
         return Some(SignalEvent::PinReceived {
             conv_id,
             sender,
+            sender_name,
             target_author,
             target_timestamp,
         });
@@ -1201,6 +1207,11 @@ fn parse_data_message(
             .and_then(|v| v.as_str())
             .unwrap_or("unknown")
             .to_string();
+        let sender_name = envelope
+            .get("sourceName")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
         let group_id = data
             .get("groupInfo")
             .and_then(|g| g.get("groupId"))
@@ -1211,6 +1222,7 @@ fn parse_data_message(
         return Some(SignalEvent::UnpinReceived {
             conv_id,
             sender,
+            sender_name,
             target_author,
             target_timestamp,
         });
@@ -1404,6 +1416,11 @@ fn parse_sent_sync(
             .and_then(|v| v.as_str())
             .unwrap_or("unknown")
             .to_string();
+        let sender_name = envelope
+            .get("sourceName")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
         let group_id = sent
             .get("groupInfo")
             .and_then(|g| g.get("groupId"))
@@ -1420,6 +1437,7 @@ fn parse_sent_sync(
         return Some(SignalEvent::PinReceived {
             conv_id,
             sender,
+            sender_name,
             target_author,
             target_timestamp,
         });
@@ -1434,6 +1452,11 @@ fn parse_sent_sync(
             .and_then(|v| v.as_str())
             .unwrap_or("unknown")
             .to_string();
+        let sender_name = envelope
+            .get("sourceName")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
         let group_id = sent
             .get("groupInfo")
             .and_then(|g| g.get("groupId"))
@@ -1450,6 +1473,7 @@ fn parse_sent_sync(
         return Some(SignalEvent::UnpinReceived {
             conv_id,
             sender,
+            sender_name,
             target_author,
             target_timestamp,
         });
