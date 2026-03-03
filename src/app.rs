@@ -6465,7 +6465,7 @@ mod tests {
     }
 
     #[rstest]
-    fn group_menu_items_no_conversation(mut app: App) {
+    fn group_menu_items_no_conversation(app: App) {
         let items = app.group_menu_items();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].label, "Create group");
