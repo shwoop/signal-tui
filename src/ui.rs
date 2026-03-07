@@ -2108,15 +2108,20 @@ fn draw_autocomplete(frame: &mut Frame, app: &App, input_area: Rect) {
 
     let count = lines.len();
 
-    // Size the popup
+    // Size the popup, clamping to available space
+    let terminal_height = frame.area().height;
     let popup_width = (max_content_width as u16 + 2).min(terminal_width.saturating_sub(2)).max(20);
-    let popup_height = (count as u16) + 2; // +2 for border
+    let popup_height = ((count as u16) + 2).min(input_area.y).min(terminal_height); // +2 for border
+    if popup_height < 3 {
+        return; // not enough space to render anything useful
+    }
 
     // Position above the input box, left-aligned with it
     let x = input_area.x;
     let y = input_area.y.saturating_sub(popup_height);
 
-    let area = Rect::new(x, y, popup_width, popup_height);
+    let area = Rect::new(x, y, popup_width.min(terminal_width.saturating_sub(x)), popup_height);
+    lines.truncate((popup_height.saturating_sub(2)) as usize);
 
     // Clear the area behind the popup so chat text doesn't leak through
     frame.render_widget(Clear, area);
