@@ -1,5 +1,20 @@
 # Changelog
 
+## v1.2.2
+
+### Bug fixes
+
+- **Uppercase keybindings broken** -- Shift+J/K (focus next/prev message),
+  G (scroll to bottom), N (prev search), Y (copy all), and other uppercase
+  bindings stopped working after the keybindings refactor. crossterm sends
+  uppercase chars with a SHIFT modifier that the lookup didn't account for
+- **j/k scroll snapping back** -- pressing j/k to scroll would briefly shift
+  the viewport then immediately snap back to the bottom. The draw code was
+  deriving a focus index that triggered a "keep focused message visible"
+  adjustment on the next frame
+
+---
+
 ## v1.2.1
 
 ### Bug fixes
