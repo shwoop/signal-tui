@@ -14,6 +14,8 @@ linked devices) sync into the TUI automatically.
 - **Other files** -- shown as `[attachment: filename]` with the download path
 - **Send files** -- use `/attach` to open a file browser and attach a file to
   your next message
+- **Clipboard paste** -- use `/paste` to send images directly from your clipboard
+  (e.g. screenshots). Text clipboard contents are inserted into the input buffer
 
 Received attachments are saved to the `download_dir` configured in your config file
 (default: `~/signal-downloads/`).

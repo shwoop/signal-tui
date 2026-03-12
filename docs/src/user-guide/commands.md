@@ -10,6 +10,7 @@ All commands start with `/`. Type `/` in Insert mode to open the autocomplete po
 | `/part` | `/p` | | Leave current conversation |
 | `/search` | `/s` | `<query>` | Search messages across all conversations |
 | `/attach` | `/a` | | Open file browser to attach a file |
+| `/paste` | `/pa` | | Paste from clipboard (text or image) |
 | `/sidebar` | `/sb` | | Toggle sidebar visibility |
 | `/bell` | `/notify` | `[type]` | Toggle notifications (`direct`, `group`, or both) |
 | `/mute` | | | Mute/unmute current conversation |
@@ -85,6 +86,15 @@ complete the selection.
 This opens a file browser. Navigate with `j`/`k`, Enter to select a file or
 enter a directory, Backspace to go up. The selected file attaches to your next
 message.
+
+**Paste a screenshot from clipboard:**
+```
+/paste
+```
+
+If the clipboard contains an image (e.g. a screenshot), it's saved as a temp PNG
+and staged as an attachment. If it contains text, the text is inserted into the
+input buffer.
 
 **Block the current conversation:**
 ```

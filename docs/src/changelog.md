@@ -1,5 +1,66 @@
 # Changelog
 
+## v1.4.1
+
+### New features
+
+- **Clipboard paste** -- `/paste` (alias `/pa`) pastes clipboard contents directly
+  into a conversation. Images (e.g. screenshots) are saved as a temp PNG and staged
+  as an attachment with inline preview. Text pastes into the input buffer (#217)
+
+### Bug fixes
+
+- **Typing indicator bleed** -- group typing events were keyed by sender phone
+  number instead of group ID, causing indicators to appear in unrelated
+  conversations. Now correctly scoped to the conversation they belong to (#215)
+
+### Enhancements
+
+- **Outgoing image preview** -- sending an image attachment now renders an inline
+  preview in the chat area immediately, matching the behavior of received images
+  (#217)
+
+Thanks to [@shwoop](https://github.com/shwoop) for both changes in this release.
+
+---
+
+## v1.4.0
+
+### New features
+
+- **Settings profiles** -- predefined profiles (Default, Compact, Minimal) that
+  apply a set of display settings at once. Select from `/settings` > Profile (#210)
+- **Date separators** -- day-boundary separator lines between messages showing
+  "Today", "Yesterday", or full date. Toggle via `/settings` (#210)
+- **Background image** -- set a background image for the chat area via
+  `background_image` in config.toml. Renders as dimmed halfblock art behind
+  messages (#210)
+- **Startup spinner** -- shows a spinner with status messages (syncing, loading
+  contacts/groups/identities) during startup instead of a blank screen (#196)
+- **Quit confirmation** -- prompts before quitting if there's unsent text in the
+  input buffer (#203)
+
+### Bug fixes
+
+- **Disappearing message icon clipping** -- the timer icon was overlapping the
+  timestamp on narrow windows. Now properly spaced (#201)
+- **iTerm2 image squishing** -- images squished vertically when the chat was
+  partially scrolled. Fixed pixel-level offset calculation (#198)
+
+### Enhancements
+
+- **Kitty Unicode Placeholders** -- native image rendering now uses Kitty's
+  Unicode placeholder method for flicker-free, properly composited images (#195)
+- **Settings hints** -- settings menu items now show a brief description of what
+  each toggle does (#193)
+- **Sidebar reorder on activity** -- the sidebar now reorders conversations to
+  the top when messages are sent or received, keeping active chats visible (#205,
+  #212)
+
+Thanks to [@Dowsley](https://github.com/Dowsley) for #195, #198, and #205.
+
+---
+
 ## v1.3.3
 
 ### Bug fixes
