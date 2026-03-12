@@ -5683,8 +5683,7 @@ impl App {
                 }
             }
             InputAction::Paste => {
-                // Clipboard paste — not yet implemented
-                self.status_message = "/paste: clipboard paste not yet implemented".to_string();
+                return self.handle_paste_command();
             }
             InputAction::Unknown(msg) => {
                 self.status_message = msg;
