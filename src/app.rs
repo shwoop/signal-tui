@@ -9372,4 +9372,68 @@ mod tests {
         app.handle_signal_event(SignalEvent::MessageReceived(msg));
         assert_eq!(app.conversations["+1"].expiration_timer, 3600);
     }
+
+    // --- Paste command tests ---
+
+    #[rstest]
+    fn paste_text_inserts_into_input_buffer(mut app: App) {
+        app.mode = InputMode::Insert;
+        app.active_conversation = Some("test-conv".to_string());
+        app.handle_paste_text("hello world");
+        assert_eq!(app.input_buffer, "hello world");
+    }
+
+    #[rstest]
+    fn paste_file_path_sets_pending_attachment(mut app: App) {
+        let path = format!("{}/Cargo.toml", env!("CARGO_MANIFEST_DIR"));
+        app.active_conversation = Some("test-conv".to_string());
+        app.handle_paste_text(&path);
+        assert!(app.pending_attachment.is_some());
+        assert_eq!(
+            app.pending_attachment.as_ref().unwrap().to_string_lossy().as_ref(),
+            path.as_str()
+        );
+        assert!(app.input_buffer.is_empty());
+    }
+
+    #[rstest]
+    fn paste_empty_text_shows_status_message(mut app: App) {
+        app.active_conversation = Some("test-conv".to_string());
+        app.handle_paste_text("   ");
+        assert!(app.status_message.contains("empty"));
+        assert!(app.pending_attachment.is_none());
+    }
+
+    #[rstest]
+    fn paste_clipboard_image_saves_png_as_attachment(mut app: App) {
+        let img_data = arboard::ImageData {
+            width: 2,
+            height: 2,
+            bytes: std::borrow::Cow::Owned(vec![
+                255, 0, 0, 255,
+                0, 255, 0, 255,
+                0, 0, 255, 255,
+                255, 255, 0, 255,
+            ]),
+        };
+
+        app.active_conversation = Some("test-conv".to_string());
+        app.handle_clipboard_image(img_data);
+
+        assert!(app.pending_attachment.is_some());
+        let path = app.pending_attachment.as_ref().unwrap();
+        assert!(path.exists(), "PNG file should have been written to disk");
+        assert!(path.to_string_lossy().contains("clipboard_"));
+        assert!(path.extension().map_or(false, |e| e == "png"));
+
+        // Clean up
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[rstest]
+    fn paste_command_without_active_conversation_sets_error(mut app: App) {
+        // active_conversation is None by default in test fixture
+        app.handle_paste_command();
+        assert!(app.status_message.contains("No active conversation"));
+    }
 }
