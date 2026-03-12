@@ -442,6 +442,8 @@ pub struct App {
     pub file_browser_error: Option<String>,
     /// File selected for sending as attachment
     pub pending_attachment: Option<PathBuf>,
+    /// Directory for temporary clipboard paste files (PID-scoped to avoid conflicts)
+    paste_temp_path: PathBuf,
     /// Reply target: (author_phone, body_snippet, timestamp_ms)
     pub reply_target: Option<(String, String, i64)>,
     /// Delete confirmation overlay visible
@@ -2817,6 +2819,11 @@ impl App {
             file_browser_filtered: Vec::new(),
             file_browser_error: None,
             pending_attachment: None,
+            paste_temp_path: {
+                let dir = std::env::temp_dir().join(format!("siggy-paste-{}", std::process::id()));
+                let _ = std::fs::create_dir_all(&dir);
+                dir
+            },
             reply_target: None,
             show_delete_confirm: false,
             editing_message: None,
@@ -6059,6 +6066,84 @@ impl App {
             self.typing_sent = true;
             return self.build_typing_request(false);
         }
+        None
+    }
+
+    /// Handle text content from clipboard: file path detection or plain text insert.
+    fn handle_paste_text(&mut self, text: &str) -> Option<SendRequest> {
+        if text.trim().is_empty() {
+            self.status_message = "Clipboard is empty".to_string();
+            return None;
+        }
+
+        let path = PathBuf::from(text.trim());
+        if path.is_absolute() && path.exists() && path.is_file() {
+            self.pending_attachment = Some(path.clone());
+            let fname = path.file_name()
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or_else(|| "file".to_string());
+            self.status_message = format!("Pasted file: {fname}");
+            return None;
+        }
+
+        self.handle_paste(text.trim().to_string())
+    }
+
+    /// Save clipboard image data to a temp PNG file and stage it as an attachment.
+    fn handle_clipboard_image(&mut self, img_data: arboard::ImageData) -> Option<SendRequest> {
+        use image::{ImageBuffer, RgbaImage};
+
+        let width = img_data.width as u32;
+        let height = img_data.height as u32;
+
+        let img: RgbaImage = match ImageBuffer::from_raw(width, height, img_data.bytes.into_owned()) {
+            Some(img) => img,
+            None => {
+                self.status_message = "Failed to decode clipboard image".to_string();
+                return None;
+            }
+        };
+
+        let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+        let filename = format!("clipboard_{timestamp}.png");
+        let path = self.paste_temp_path.join(&filename);
+
+        if let Err(e) = img.save(&path) {
+            self.status_message = format!("Failed to save clipboard image: {e}");
+            return None;
+        }
+
+        self.pending_attachment = Some(path);
+        self.status_message = format!("Pasted image: {filename}");
+        None
+    }
+
+    /// Handle the `/paste` command: read clipboard and act on contents.
+    pub fn handle_paste_command(&mut self) -> Option<SendRequest> {
+        if self.active_conversation.is_none() {
+            self.status_message = "No active conversation".to_string();
+            return None;
+        }
+
+        let mut clipboard = match arboard::Clipboard::new() {
+            Ok(c) => c,
+            Err(e) => {
+                self.status_message = format!("Clipboard error: {e}");
+                return None;
+            }
+        };
+
+        // Try image first (screenshots add both image and file path to clipboard — prefer image)
+        if let Ok(img_data) = clipboard.get_image() {
+            return self.handle_clipboard_image(img_data);
+        }
+
+        // Try text (includes file path detection)
+        if let Ok(text) = clipboard.get_text() {
+            return self.handle_paste_text(&text);
+        }
+
+        self.status_message = "Clipboard is empty or unsupported format".to_string();
         None
     }
 
