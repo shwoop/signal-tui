@@ -1,5 +1,36 @@
 # Changelog
 
+## v1.4.2
+
+### Bug fixes
+
+- **Paste attachment deleted before send** - `/paste` images were deleted
+  immediately after dispatching the RPC, before signal-cli could read the file.
+  Now defers cleanup until signal-cli confirms or fails the send (#229)
+
+### Internal
+
+- **Unified event loop** - consolidated `run_app` and `run_demo_app` into a
+  single function using a `MessagingBackend` enum. Demo mode now inherits all
+  main loop features (#214)
+- **File picker extraction** - moved file picker state and logic out of the App
+  god object into `domain::FilePickerState`, the first step toward #221 (#226)
+- **Dead code cleanup** - marked `find_settings_profile` as test-only with
+  `#[cfg(test)]` (#225)
+
+### Infrastructure
+
+- **Homebrew tap** - `brew tap johnsideserf/siggy && brew install siggy` now
+  works on macOS. Formula auto-updates on each release (#227)
+- **Mermaid diagrams** - added interactive architecture, data flow, and module
+  dependency diagrams to the developer guide
+
+Thanks to [@Dowsley](https://github.com/Dowsley) for #214 and #226,
+[@shwoop](https://github.com/shwoop) for #227 and #229,
+and [@zamadye](https://github.com/zamadye) for #225.
+
+---
+
 ## v1.4.1
 
 ### New features
