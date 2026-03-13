@@ -1,0 +1,44 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    - cron: "38 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    name: Sync from upstream
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Add upstream remote
+        run: git remote add upstream https://github.com/johnsideserf/signal-tui.git
+
+      - name: Fetch upstream
+        run: git fetch upstream master --tags
+
+      - name: Fast-forward master
+        run: |
+          git checkout master
+          git rebase upstream/master
+
+      - name: Push master
+        run: git push origin master
+
+      - name: Sync v* tags
+        run: |
+          # Find v* tags that exist on upstream but not on origin
+          upstream_tags=$(git tag -l 'v*' --merged upstream/master)
+          for tag in $upstream_tags; do
+            if ! git ls-remote --tags origin "refs/tags/$tag" | grep -q "$tag"; then
+              echo "Pushing new tag: $tag"
+              git push origin "refs/tags/$tag"
+            fi
+          done
