@@ -1994,6 +1994,22 @@ impl App {
                 });
             }
         }
+        if !msg.is_deleted {
+            if extract_file_uri(&msg.body).is_some() {
+                items.push(MenuAction {
+                    label: "Open attachment",
+                    key_hint: "o",
+                    nerd_icon: "\u{f15b5}",
+                });
+            }
+            if extract_http_url(&msg.body).is_some() {
+                items.push(MenuAction {
+                    label: "Open link",
+                    key_hint: "l",
+                    nerd_icon: "\u{f0337}",
+                });
+            }
+        }
         items
     }
 
@@ -2043,6 +2059,8 @@ impl App {
                         'p' => "p",
                         'v' => "v",
                         'x' => "x",
+                        'o' => "o",
+                        'l' => "l",
                         _ => return None,
                     };
                     // Only execute if this action is available in the menu
@@ -2193,6 +2211,24 @@ impl App {
                             is_group,
                             poll_timestamp,
                         });
+                    }
+                }
+                None
+            }
+            "o" => {
+                // Open attachment
+                if let Some(msg) = self.selected_message() {
+                    if let Some(uri) = extract_file_uri(&msg.body) {
+                        self.open_file(&uri);
+                    }
+                }
+                None
+            }
+            "l" => {
+                // Open link
+                if let Some(msg) = self.selected_message() {
+                    if let Some(url) = extract_http_url(&msg.body) {
+                        self.open_url(&url);
                     }
                 }
                 None
@@ -6452,6 +6488,22 @@ impl App {
         }
     }
 
+    fn open_file(&mut self, uri: &str) {
+        let path = file_uri_to_path(uri);
+        if !std::path::Path::new(&path).exists() {
+            self.status_message = format!("File not found: {path}");
+            return;
+        }
+        let filename = std::path::Path::new(&path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&path);
+        match open::that(&path) {
+            Ok(()) => self.status_message = format!("Opened {filename}"),
+            Err(e) => self.status_message = format!("Failed to open: {e}"),
+        }
+    }
+
     /// Export the active conversation's messages to a plain text file.
     fn export_chat_history(&mut self, limit: Option<usize>) {
         let conv_id = match self.active_conversation.as_ref() {
@@ -6578,6 +6630,36 @@ fn file_uri_to_path(uri: &str) -> String {
     } else {
         uri.to_string()
     }
+}
+
+/// Extract the first `file:///` URI from a message body.
+/// Stops at whitespace or `)` to handle `[image: name](file:///path)` format.
+fn extract_file_uri(body: &str) -> Option<String> {
+    let pos = body.find("file:///")?;
+    let rest = &body[pos..];
+    let end = rest
+        .find(|c: char| c.is_whitespace() || c == ')')
+        .unwrap_or(rest.len());
+    Some(rest[..end].to_string())
+}
+
+/// Extract the first `https://` or `http://` URL from a message body.
+/// Stops at whitespace or `)`.
+fn extract_http_url(body: &str) -> Option<String> {
+    let mut best: Option<(usize, &str)> = None;
+    for scheme in &["https://", "http://"] {
+        if let Some(pos) = body.find(scheme) {
+            if best.is_none() || pos < best.unwrap().0 {
+                best = Some((pos, scheme));
+            }
+        }
+    }
+    let (pos, _) = best?;
+    let rest = &body[pos..];
+    let end = rest
+        .find(|c: char| c.is_whitespace() || c == ')')
+        .unwrap_or(rest.len());
+    Some(rest[..end].to_string())
 }
 
 impl App {
@@ -9975,5 +10057,141 @@ mod tests {
             accepted: true,
         };
         assert!(uuid_contact.is_stale(), "contact with UUID-only name is stale");
+    }
+
+    #[test]
+    fn extract_file_uri_from_image_body() {
+        let body = "[image: photo.jpg](file:///home/user/photo.jpg)";
+        assert_eq!(
+            extract_file_uri(body),
+            Some("file:///home/user/photo.jpg".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_file_uri_from_attachment_body() {
+        let body = "[attachment: doc.pdf](file:///home/user/doc.pdf)";
+        assert_eq!(
+            extract_file_uri(body),
+            Some("file:///home/user/doc.pdf".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_file_uri_none_for_plain_text() {
+        assert_eq!(extract_file_uri("hello world"), None);
+    }
+
+    #[test]
+    fn extract_http_url_from_body() {
+        let body = "check this out https://example.com/page and more text";
+        assert_eq!(
+            extract_http_url(body),
+            Some("https://example.com/page".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_http_url_skips_file_uri() {
+        let body = "[image: photo.jpg](file:///home/user/photo.jpg) see https://example.com";
+        assert_eq!(
+            extract_http_url(body),
+            Some("https://example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_http_url_none_for_plain_text() {
+        assert_eq!(extract_http_url("hello world"), None);
+    }
+
+    #[test]
+    fn extract_http_url_with_trailing_paren() {
+        let body = "link (https://example.com/path) here";
+        assert_eq!(
+            extract_http_url(body),
+            Some("https://example.com/path".to_string())
+        );
+    }
+
+    // --- Action menu item tests ---
+
+    #[rstest]
+    fn action_menu_shows_open_attachment(mut app: App) {
+        let mut msg = make_msg("+1", None, None, false);
+        msg.attachments = vec![Attachment {
+            id: "123".to_string(),
+            content_type: "application/pdf".to_string(),
+            filename: Some("doc.pdf".to_string()),
+            local_path: Some("/tmp/doc.pdf".to_string()),
+        }];
+        app.handle_signal_event(SignalEvent::MessageReceived(msg));
+        app.active_conversation = Some("+1".to_string());
+        let items = app.action_menu_items();
+        assert!(items.iter().any(|a| a.label == "Open attachment"), "expected Open attachment in menu");
+    }
+
+    #[rstest]
+    fn action_menu_shows_open_link(mut app: App) {
+        let msg = make_msg("+1", Some("check https://example.com"), None, false);
+        app.handle_signal_event(SignalEvent::MessageReceived(msg));
+        app.active_conversation = Some("+1".to_string());
+        let items = app.action_menu_items();
+        assert!(items.iter().any(|a| a.label == "Open link"), "expected Open link in menu");
+    }
+
+    #[rstest]
+    fn action_menu_shows_both_open_items(mut app: App) {
+        // Send a message with a URL body and an attachment with a local path.
+        // The body and attachment are stored as separate DisplayMessages with the
+        // same timestamp; body is at index 0, attachment at index 1.
+        // Focus index 0 (the body message) to verify "Open link" appears.
+        let mut msg = make_msg("+1", Some("see https://example.com"), None, false);
+        msg.attachments = vec![Attachment {
+            id: "456".to_string(),
+            content_type: "image/png".to_string(),
+            filename: Some("photo.png".to_string()),
+            local_path: Some("/tmp/photo.png".to_string()),
+        }];
+        app.handle_signal_event(SignalEvent::MessageReceived(msg));
+        app.active_conversation = Some("+1".to_string());
+        // Index 0 is the body message ("see https://example.com")
+        app.focused_msg_index = Some(0);
+        let items_body = app.action_menu_items();
+        assert!(items_body.iter().any(|a| a.label == "Open link"), "expected Open link for body message");
+        // Index 1 is the attachment message ("[image: photo.png](file:///tmp/photo.png)")
+        app.focused_msg_index = Some(1);
+        let items_att = app.action_menu_items();
+        assert!(items_att.iter().any(|a| a.label == "Open attachment"), "expected Open attachment for attachment message");
+    }
+
+    #[rstest]
+    fn action_menu_no_open_for_plain_text(mut app: App) {
+        let msg = make_msg("+1", Some("just a regular message"), None, false);
+        app.handle_signal_event(SignalEvent::MessageReceived(msg));
+        app.active_conversation = Some("+1".to_string());
+        let items = app.action_menu_items();
+        assert!(!items.iter().any(|a| a.label == "Open attachment"), "should not have Open attachment");
+        assert!(!items.iter().any(|a| a.label == "Open link"), "should not have Open link");
+    }
+
+    #[rstest]
+    fn action_menu_respects_focused_msg_index(mut app: App) {
+        // Message 0: has a URL
+        let msg1 = make_msg("+1", Some("check https://example.com"), None, false);
+        app.handle_signal_event(SignalEvent::MessageReceived(msg1));
+        // Message 1: plain text (last/newest)
+        let msg2 = make_msg("+1", Some("just text"), None, false);
+        app.handle_signal_event(SignalEvent::MessageReceived(msg2));
+        app.active_conversation = Some("+1".to_string());
+
+        // Without focus, defaults to last message (plain text) — no Open link
+        let items = app.action_menu_items();
+        assert!(!items.iter().any(|a| a.label == "Open link"), "last msg has no URL");
+
+        // Focus the first message (the one with a URL)
+        app.focused_msg_index = Some(0);
+        let items = app.action_menu_items();
+        assert!(items.iter().any(|a| a.label == "Open link"), "focused msg has URL, should show Open link");
     }
 }
