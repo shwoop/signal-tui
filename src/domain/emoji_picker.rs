@@ -66,7 +66,7 @@ pub struct EmojiPickerState {
     pub selected_index: usize,
     pub category_index: usize,
     pub filtered: Vec<EmojiEntry>,
-    /// Grid columns — updated by the UI layer during draw.
+    /// Grid columns for keyboard navigation (derived from EMOJI_POPUP_WIDTH).
     pub cols: usize,
 }
 

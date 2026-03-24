@@ -1822,7 +1822,7 @@ fn draw_reaction_picker(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(popup, popup_area);
 }
 
-fn draw_emoji_picker(frame: &mut Frame, app: &mut App, area: Rect) {
+fn draw_emoji_picker(frame: &mut Frame, app: &App, area: Rect) {
     let theme = &app.theme;
 
     let title = if app.emoji_picker.filter.is_empty() {
@@ -1842,10 +1842,7 @@ fn draw_emoji_picker(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    // Update grid columns for key handler (each emoji cell = 3 columns: emoji + space)
-    let cols = ((inner.width as usize).saturating_sub(1)) / 3;
-    let cols = cols.max(1);
-    app.emoji_picker.cols = cols;
+    let cols = app.emoji_picker.cols;
 
     let mut lines: Vec<Line<'static>> = Vec::new();
 
