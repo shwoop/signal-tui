@@ -420,6 +420,8 @@ pub struct App {
     pub focused_message_time: Option<DateTime<Utc>>,
     /// Index of the focused message in the active conversation (set during draw)
     pub focused_msg_index: Option<usize>,
+    /// Pending normal-mode prefix key (e.g. first `g` of `gg`, first `d` of `dd`)
+    pub pending_normal_key: Option<char>,
     /// Jump-back stack: saved (scroll_offset, focused_msg_index) before quote jumps
     pub jump_stack: Vec<(usize, Option<usize>)>,
     /// Reaction display preferences and picker overlay state
@@ -2625,6 +2627,7 @@ impl App {
             pending_receipts: Vec::new(),
             focused_message_time: None,
             focused_msg_index: None,
+            pending_normal_key: None,
             jump_stack: Vec::new(),
             reactions: ReactionState::new(),
             groups: HashMap::new(),
@@ -3165,6 +3168,38 @@ impl App {
 
     /// Handle Normal mode key. Dispatches to scroll, edit, or action sub-handlers.
     pub fn handle_normal_key(&mut self, modifiers: KeyModifiers, code: KeyCode) -> Option<SendRequest> {
+        // Handle pending prefix key (gg, dd sequences)
+        if let Some(prev) = self.pending_normal_key.take() {
+            match (prev, code) {
+                ('g', KeyCode::Char('g')) => {
+                    // gg = scroll to top
+                    if let Some(ref id) = self.active_conversation {
+                        if let Some(conv) = self.conversations.get(id) {
+                            self.scroll_offset = conv.messages.len();
+                        }
+                    }
+                    self.focused_msg_index = None;
+                    return None;
+                }
+                ('d', KeyCode::Char('d')) => {
+                    // dd = delete message
+                    if let Some(msg) = self.selected_message() {
+                        if !msg.is_system && !msg.is_deleted {
+                            self.show_delete_confirm = true;
+                        }
+                    }
+                    return None;
+                }
+                (_, KeyCode::Esc) => {
+                    // Esc cancels pending prefix
+                    return None;
+                }
+                _ => {
+                    // Not a valid sequence -- fall through to process this key normally
+                }
+            }
+        }
+
         match self.keybindings.resolve(modifiers, code, BindingMode::Normal) {
             // Scroll
             Some(KeyAction::ScrollDown) => { self.scroll_offset = self.scroll_offset.saturating_sub(1); self.focused_msg_index = None; None }
@@ -3173,15 +3208,6 @@ impl App {
             Some(KeyAction::FocusPrevMessage) => { self.jump_to_adjacent_message(true); None }
             Some(KeyAction::HalfPageDown) => { self.scroll_offset = self.scroll_offset.saturating_sub(10); self.focused_msg_index = None; None }
             Some(KeyAction::HalfPageUp) => { self.scroll_offset = self.scroll_offset.saturating_add(10); self.focused_msg_index = None; None }
-            Some(KeyAction::ScrollToTop) => {
-                if let Some(ref id) = self.active_conversation {
-                    if let Some(conv) = self.conversations.get(id) {
-                        self.scroll_offset = conv.messages.len();
-                    }
-                }
-                self.focused_msg_index = None;
-                None
-            }
             Some(KeyAction::ScrollToBottom) => { self.scroll_offset = 0; self.focused_msg_index = None; None }
             // Edit/mode-switch
             Some(KeyAction::InsertAtCursor) => { self.mode = InputMode::Insert; None }
@@ -3192,7 +3218,14 @@ impl App {
             }
             Some(KeyAction::InsertLineStart) => { self.input_cursor = self.current_line_start(); self.mode = InputMode::Insert; None }
             Some(KeyAction::InsertLineEnd) => { self.input_cursor = self.current_line_end(); self.mode = InputMode::Insert; None }
-            Some(KeyAction::OpenLineBelow) => { self.input_buffer.clear(); self.input_cursor = 0; self.mode = InputMode::Insert; None }
+            Some(KeyAction::OpenLineBelow) => {
+                let line_end = self.current_line_end();
+                self.input_cursor = line_end;
+                self.input_buffer.insert(self.input_cursor, '\n');
+                self.input_cursor += 1;
+                self.mode = InputMode::Insert;
+                None
+            }
             Some(KeyAction::CursorLeft) => { self.input_cursor = prev_char_pos(&self.input_buffer, self.input_cursor); None }
             Some(KeyAction::CursorRight) => {
                 self.input_cursor = next_char_pos(&self.input_buffer, self.input_cursor);
@@ -3324,14 +3357,6 @@ impl App {
                 }
                 None
             }
-            Some(KeyAction::DeleteMessage) => {
-                if let Some(msg) = self.selected_message() {
-                    if !msg.is_system && !msg.is_deleted {
-                        self.show_delete_confirm = true;
-                    }
-                }
-                None
-            }
             Some(KeyAction::NextSearchResult) => {
                 if !self.search.results.is_empty() { self.jump_to_search_result(true); }
                 None
@@ -3350,7 +3375,15 @@ impl App {
             Some(KeyAction::PinMessage) => self.execute_pin_toggle(),
             Some(KeyAction::JumpToQuote) => { self.jump_to_quote(); None }
             Some(KeyAction::JumpBack) => { self.jump_back(); None }
-            _ => None,
+            _ => {
+                // Handle prefix keys that aren't in the binding map
+                if let KeyCode::Char(c @ ('g' | 'd')) = code {
+                    if modifiers.is_empty() {
+                        self.pending_normal_key = Some(c);
+                    }
+                }
+                None
+            }
         }
     }
 
@@ -3360,6 +3393,7 @@ impl App {
         match self.keybindings.resolve(modifiers, code, BindingMode::Insert) {
             Some(KeyAction::ExitInsert) => {
                 self.mode = InputMode::Normal;
+                self.pending_normal_key = None; // defensive reset
                 self.autocomplete_visible = false;
                 self.reply_target = None;
                 self.editing_message = None;
@@ -7067,6 +7101,7 @@ mod tests {
     use super::*;
     use crate::db::Database;
     use crate::signal::types::{Attachment, Contact, Group, Mention, SignalEvent, SignalMessage, StyleType, TextStyle};
+    use crossterm::event::{KeyCode, KeyModifiers};
     use rstest::{fixture, rstest};
 
     #[fixture]
@@ -9673,6 +9708,129 @@ mod tests {
         app.forward.show = false;
 
         assert!(!app.has_overlay());
+    }
+
+    // --- Vim normal-mode keybinding tests ---
+
+    #[rstest]
+    fn gg_scrolls_to_top(mut app: App) {
+        for i in 0..20 {
+            let msg = make_msg("+1", Some(&format!("msg {i}")), None, false);
+            app.handle_signal_event(SignalEvent::MessageReceived(msg));
+        }
+        app.active_conversation = Some("+1".to_string());
+        app.scroll_offset = 0;
+        app.mode = InputMode::Normal;
+
+        // First g sets pending
+        app.handle_normal_key(KeyModifiers::NONE, KeyCode::Char('g'));
+        assert_eq!(app.pending_normal_key, Some('g'));
+
+        // Second g scrolls to top
+        app.handle_normal_key(KeyModifiers::NONE, KeyCode::Char('g'));
+        assert_eq!(app.pending_normal_key, None);
+        assert_eq!(app.scroll_offset, 20);
+    }
+
+    #[rstest]
+    fn dd_shows_delete_confirm(mut app: App) {
+        let msg = make_msg("+1", Some("hello"), None, false);
+        app.handle_signal_event(SignalEvent::MessageReceived(msg));
+        app.active_conversation = Some("+1".to_string());
+        app.mode = InputMode::Normal;
+
+        // First d sets pending
+        app.handle_normal_key(KeyModifiers::NONE, KeyCode::Char('d'));
+        assert_eq!(app.pending_normal_key, Some('d'));
+        assert!(!app.show_delete_confirm);
+
+        // Second d triggers delete confirm
+        app.handle_normal_key(KeyModifiers::NONE, KeyCode::Char('d'));
+        assert_eq!(app.pending_normal_key, None);
+        assert!(app.show_delete_confirm);
+    }
+
+    #[rstest]
+    fn pending_key_cancelled_by_esc(mut app: App) {
+        app.mode = InputMode::Normal;
+        app.handle_normal_key(KeyModifiers::NONE, KeyCode::Char('g'));
+        assert_eq!(app.pending_normal_key, Some('g'));
+
+        app.handle_normal_key(KeyModifiers::NONE, KeyCode::Esc);
+        assert_eq!(app.pending_normal_key, None);
+    }
+
+    #[rstest]
+    fn pending_key_discarded_on_other_key(mut app: App) {
+        let msg = make_msg("+1", Some("hello"), None, false);
+        app.handle_signal_event(SignalEvent::MessageReceived(msg));
+        app.active_conversation = Some("+1".to_string());
+        app.mode = InputMode::Normal;
+
+        app.handle_normal_key(KeyModifiers::NONE, KeyCode::Char('g'));
+        assert_eq!(app.pending_normal_key, Some('g'));
+
+        // Pressing 'j' clears pending and processes j normally
+        app.handle_normal_key(KeyModifiers::NONE, KeyCode::Char('j'));
+        assert_eq!(app.pending_normal_key, None);
+    }
+
+    #[rstest]
+    fn o_preserves_input_buffer(mut app: App) {
+        app.mode = InputMode::Normal;
+        app.input_buffer = "hello world".to_string();
+        app.input_cursor = 5;
+
+        app.handle_normal_key(KeyModifiers::NONE, KeyCode::Char('o'));
+
+        assert_eq!(app.mode, InputMode::Insert);
+        assert_eq!(app.input_buffer, "hello world\n");
+        assert_eq!(app.input_cursor, 12);
+    }
+
+    #[rstest]
+    fn jk_focus_messages(mut app: App) {
+        for i in 0..5 {
+            let msg = make_msg("+1", Some(&format!("msg {i}")), None, false);
+            app.handle_signal_event(SignalEvent::MessageReceived(msg));
+        }
+        app.active_conversation = Some("+1".to_string());
+        app.mode = InputMode::Normal;
+
+        // k (FocusPrevMessage) should invoke jump_to_adjacent_message
+        app.handle_normal_key(KeyModifiers::NONE, KeyCode::Char('k'));
+        assert!(app.focused_msg_index.is_some());
+    }
+
+    #[rstest]
+    fn pending_key_cleared_on_mode_transition(mut app: App) {
+        app.mode = InputMode::Normal;
+
+        // Press g to set pending
+        app.handle_normal_key(KeyModifiers::NONE, KeyCode::Char('g'));
+        assert_eq!(app.pending_normal_key, Some('g'));
+
+        // Press i to enter Insert mode -- pending should be cleared
+        app.handle_normal_key(KeyModifiers::NONE, KeyCode::Char('i'));
+        assert_eq!(app.pending_normal_key, None);
+        assert_eq!(app.mode, InputMode::Insert);
+    }
+
+    #[rstest]
+    fn ctrl_e_scrolls_without_focus(mut app: App) {
+        for i in 0..20 {
+            let msg = make_msg("+1", Some(&format!("msg {i}")), None, false);
+            app.handle_signal_event(SignalEvent::MessageReceived(msg));
+        }
+        app.active_conversation = Some("+1".to_string());
+        app.mode = InputMode::Normal;
+        app.scroll_offset = 5;
+        app.focused_msg_index = Some(10);
+
+        // Ctrl-E (ScrollDown) should scroll viewport and clear focus
+        app.handle_normal_key(KeyModifiers::CONTROL, KeyCode::Char('e'));
+        assert_eq!(app.scroll_offset, 4);
+        assert_eq!(app.focused_msg_index, None);
     }
 
     // --- Helper for building a SignalMessage ---
