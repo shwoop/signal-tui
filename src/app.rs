@@ -62,6 +62,18 @@ fn floor_char_boundary(buf: &str, pos: usize) -> usize {
     p
 }
 
+/// Format a mute duration in seconds as a human-readable label (e.g. "1h", "1d", "1w").
+fn format_mute_duration(secs: u64) -> String {
+    debug_assert!(secs >= 3_600, "format_mute_duration called with sub-hour secs={secs}");
+    if secs >= 7 * 86_400 {
+        format!("{}w", secs / (7 * 86_400))
+    } else if secs >= 86_400 {
+        format!("{}d", secs / 86_400)
+    } else {
+        format!("{}h", secs / 3_600)
+    }
+}
+
 /// Log a database error via debug_log (no-op when --debug is off).
 fn db_warn<T>(result: Result<T, impl std::fmt::Display>, context: &str) {
     if let Err(e) = result {
@@ -6174,9 +6186,49 @@ impl App {
                     }
                 }
             }
-            InputAction::Mute(_opt_duration) => {
-                // TODO: full implementation in Task 5
-                todo!()
+            InputAction::Mute(opt_duration_secs) => {
+                if let Some(ref conv_id) = self.active_conversation {
+                    let conv_id = conv_id.clone();
+                    let name = self
+                        .conversations
+                        .get(&conv_id)
+                        .map(|c| c.name.clone())
+                        .unwrap_or_else(|| conv_id.clone());
+
+                    match opt_duration_secs {
+                        None => {
+                            // Toggle: if currently muted, unmute; else permanent mute
+                            if self.is_muted_now(&conv_id) {
+                                self.muted_conversations.remove(&conv_id);
+                                self.status_message = format!("unmuted {name}");
+                                db_warn(self.db.set_mute_until(&conv_id, None), "set_mute_until");
+                            } else {
+                                self.muted_conversations.insert(conv_id.clone(), 0);
+                                self.status_message = format!("muted {name}");
+                                db_warn(
+                                    self.db.set_mute_until(&conv_id, Some(0)),
+                                    "set_mute_until",
+                                );
+                            }
+                        }
+                        Some(secs) => {
+                            let now = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs() as i64;
+                            let until = now.saturating_add(secs.min(i64::MAX as u64) as i64);
+                            self.muted_conversations.insert(conv_id.clone(), until);
+                            let label = format_mute_duration(secs);
+                            self.status_message = format!("muted {name} for {label}");
+                            db_warn(
+                                self.db.set_mute_until(&conv_id, Some(until)),
+                                "set_mute_until",
+                            );
+                        }
+                    }
+                } else {
+                    self.status_message = "no active conversation to mute".to_string();
+                }
             }
             InputAction::Block => {
                 if let Some(ref conv_id) = self.active_conversation {
