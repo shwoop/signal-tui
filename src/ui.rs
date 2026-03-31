@@ -753,7 +753,7 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
             }
 
             // Conversation name
-            let is_muted = app.muted_conversations.contains(id);
+            let is_muted = app.muted_conversations.contains_key(id);
             let name_style = if is_active {
                 Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)
             } else if has_unread {
@@ -773,7 +773,37 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
             }
 
             if is_muted {
-                spans.push(Span::styled(" ~", Style::default().fg(theme.fg_muted)));
+                // Show remaining mute time or permanent indicator
+                let mute_indicator = if let Some(&expiry_ms) = app.muted_conversations.get(id) {
+                    if expiry_ms == 0 {
+                        // Permanent mute
+                        " ~".to_string()
+                    } else {
+                        // Calculate remaining time
+                        let now_ms = chrono::Utc::now().timestamp_millis();
+                        let remaining_ms = expiry_ms.saturating_sub(now_ms);
+                        if remaining_ms <= 0 {
+                            " ~".to_string() // Expired, will be auto-unmuted
+                        } else if remaining_ms >= 7 * 24 * 60 * 60 * 1000 {
+                            let weeks = remaining_ms / (7 * 24 * 60 * 60 * 1000);
+                            format!(" ~{}w", weeks)
+                        } else if remaining_ms >= 24 * 60 * 60 * 1000 {
+                            let days = remaining_ms / (24 * 60 * 60 * 1000);
+                            format!(" ~{}d", days)
+                        } else if remaining_ms >= 60 * 60 * 1000 {
+                            let hours = remaining_ms / (60 * 60 * 1000);
+                            format!(" ~{}h", hours)
+                        } else {
+                            " ~".to_string()
+                        }
+                    }
+                } else {
+                    " ~".to_string()
+                };
+                spans.push(Span::styled(
+                    mute_indicator,
+                    Style::default().fg(theme.fg_muted),
+                ));
             }
             if app.blocked_conversations.contains(id) {
                 spans.push(Span::styled(" x", Style::default().fg(theme.error)));

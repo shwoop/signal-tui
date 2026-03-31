@@ -389,8 +389,8 @@ pub struct App {
     pub contact_names: HashMap<String, String>,
     /// Notification preferences and clipboard auto-clear state
     pub notifications: NotificationState,
-    /// Conversations muted from notifications
-    pub muted_conversations: HashSet<String>,
+    /// Conversations muted from notifications (conv_id -> expiry_ms, where 0 = permanent)
+    pub muted_conversations: HashMap<String, i64>,
     /// Conversations blocked via signal-cli
     pub blocked_conversations: HashSet<String>,
     /// Autocomplete popup visible
@@ -2863,7 +2863,7 @@ impl App {
             connection_error: None,
             contact_names: HashMap::new(),
             notifications: NotificationState::new(),
-            muted_conversations: HashSet::new(),
+            muted_conversations: HashMap::new(),
             blocked_conversations: HashSet::new(),
             autocomplete_visible: false,
             autocomplete_candidates: Vec::new(),
@@ -3012,7 +3012,9 @@ impl App {
         }
 
         self.conversation_order = order;
-        self.muted_conversations = self.db.load_muted()?;
+        // Load muted conversations with expiry times
+        let muted_list = self.db.load_muted()?;
+        self.muted_conversations = muted_list.into_iter().collect();
         self.blocked_conversations = self.db.load_blocked()?;
 
         // Fix 1:1 conversations still named as phone numbers: scan message senders
@@ -4521,9 +4523,25 @@ impl App {
                 .get(&conv_id)
                 .map(|c| c.accepted)
                 .unwrap_or(true);
-            let not_muted_or_blocked = conv_accepted
-                && !self.muted_conversations.contains(&conv_id)
-                && !self.blocked_conversations.contains(&conv_id);
+            // Check if muted (considering expiry)
+            let expiry_ms = self.muted_conversations.get(&conv_id).copied();
+            let is_muted = match expiry_ms {
+                Some(expiry) if expiry > 0 => {
+                    let now_ms = chrono::Utc::now().timestamp_millis();
+                    if expiry < now_ms {
+                        // Expired - auto-unmute
+                        self.muted_conversations.remove(&conv_id);
+                        self.db.set_mute_expiry(&conv_id, 0).ok();
+                        false
+                    } else {
+                        true
+                    }
+                }
+                Some(0) => true, // Permanent mute
+                _ => false,
+            };
+            let not_muted_or_blocked =
+                conv_accepted && !is_muted && !self.blocked_conversations.contains(&conv_id);
             let type_enabled = if is_group {
                 self.notifications.notify_group
             } else {
@@ -6174,26 +6192,51 @@ impl App {
                     }
                 }
             }
-            InputAction::ToggleMute => {
+            InputAction::ToggleMute(duration_ms) => {
                 if let Some(ref conv_id) = self.active_conversation {
                     let conv_id = conv_id.clone();
-                    if self.muted_conversations.remove(&conv_id) {
-                        let name = self
-                            .conversations
-                            .get(&conv_id)
-                            .map(|c| c.name.as_str())
-                            .unwrap_or(&conv_id);
-                        self.status_message = format!("unmuted {name}");
-                        db_warn(self.db.set_muted(&conv_id, false), "set_muted");
-                    } else {
-                        let name = self
-                            .conversations
-                            .get(&conv_id)
-                            .map(|c| c.name.as_str())
-                            .unwrap_or(&conv_id);
-                        self.status_message = format!("muted {name}");
-                        self.muted_conversations.insert(conv_id.clone());
-                        db_warn(self.db.set_muted(&conv_id, true), "set_muted");
+                    let name = self
+                        .conversations
+                        .get(&conv_id)
+                        .map(|c| c.name.as_str())
+                        .unwrap_or(&conv_id);
+
+                    // Check if already muted
+                    let current_expiry = self.muted_conversations.get(&conv_id).copied();
+
+                    match (duration_ms, current_expiry) {
+                        // Unmute: no duration provided and currently muted
+                        (None, Some(_)) => {
+                            self.muted_conversations.remove(&conv_id);
+                            db_warn(self.db.set_mute_expiry(&conv_id, 0), "set_mute_expiry");
+                            self.status_message = format!("unmuted {name}");
+                        }
+                        // Mute with duration
+                        (Some(duration), _) => {
+                            let now_ms = chrono::Utc::now().timestamp_millis();
+                            let expiry_ms = now_ms + duration;
+                            self.muted_conversations.insert(conv_id.clone(), expiry_ms);
+                            db_warn(
+                                self.db.set_mute_expiry(&conv_id, expiry_ms),
+                                "set_mute_expiry",
+                            );
+
+                            // Format duration for display
+                            let duration_display = if duration >= 7 * 24 * 60 * 60 * 1000 {
+                                format!("{}w", duration / (7 * 24 * 60 * 60 * 1000))
+                            } else if duration >= 24 * 60 * 60 * 1000 {
+                                format!("{}d", duration / (24 * 60 * 60 * 1000))
+                            } else {
+                                format!("{}h", duration / (60 * 60 * 1000))
+                            };
+                            self.status_message = format!("muted {name} for {duration_display}");
+                        }
+                        // Toggle to permanent mute: no duration and not currently muted
+                        (None, None) => {
+                            self.muted_conversations.insert(conv_id.clone(), 0); // 0 = permanent
+                            db_warn(self.db.set_mute_expiry(&conv_id, 0), "set_mute_expiry");
+                            self.status_message = format!("muted {name}");
+                        }
                     }
                 } else {
                     self.status_message = "no active conversation to mute".to_string();

@@ -34,8 +34,8 @@ pub const COMMANDS: &[CommandInfo] = &[
     CommandInfo {
         name: "/mute",
         alias: "",
-        args: "",
-        description: "Mute/unmute current chat",
+        args: "[duration]",
+        description: "Mute/unmute current chat (duration: 1h, 8h, 1d, 1w)",
     },
     CommandInfo {
         name: "/block",
@@ -153,6 +153,31 @@ pub const COMMANDS: &[CommandInfo] = &[
     },
 ];
 
+/// Parse a mute duration string into milliseconds.
+/// Supports: 1h, 8h, 1d, 1w (hours, days, weeks)
+/// Returns None if the duration is invalid or empty.
+pub fn parse_mute_duration(duration: &str) -> Option<i64> {
+    let duration = duration.trim();
+    if duration.is_empty() {
+        return None;
+    }
+
+    let (num_str, unit) = duration.split_at(duration.len() - 1);
+    let num: i64 = num_str.parse().ok()?;
+    if num <= 0 {
+        return None;
+    }
+
+    let milliseconds_per_unit = match unit {
+        "h" => 60 * 60 * 1000,          // hours
+        "d" => 24 * 60 * 60 * 1000,     // days
+        "w" => 7 * 24 * 60 * 60 * 1000, // weeks
+        _ => return None,
+    };
+
+    Some(num * milliseconds_per_unit)
+}
+
 /// Parsed user input — either a command or plain text to send
 #[derive(Debug, PartialEq)]
 pub enum InputAction {
@@ -168,8 +193,8 @@ pub enum InputAction {
     ToggleSidebar,
     /// Toggle terminal bell notifications (None = both, Some("direct"/"group") = specific)
     ToggleBell(Option<String>),
-    /// Mute/unmute the current conversation
-    ToggleMute,
+    /// Mute/unmute the current conversation (Option<i64> = duration in ms, None = toggle permanent)
+    ToggleMute(Option<i64>),
     /// Block the current contact/group
     Block,
     /// Unblock the current contact/group
@@ -251,7 +276,20 @@ pub fn parse_input(input: &str) -> InputAction {
                 InputAction::ToggleBell(Some(arg))
             }
         }
-        "/mute" => InputAction::ToggleMute,
+        "/mute" => {
+            if arg.is_empty() {
+                InputAction::ToggleMute(None) // Toggle permanent mute
+            } else {
+                // Try to parse duration
+                match parse_mute_duration(&arg) {
+                    Some(duration_ms) => InputAction::ToggleMute(Some(duration_ms)),
+                    None => InputAction::Unknown(format!(
+                        "invalid mute duration: {} (use 1h, 8h, 1d, 1w)",
+                        arg
+                    )),
+                }
+            }
+        }
         "/block" => InputAction::Block,
         "/unblock" => InputAction::Unblock,
         "/attach" | "/a" => InputAction::Attach,
@@ -453,7 +491,7 @@ mod tests {
     #[case("/q", InputAction::Quit)]
     #[case("/sidebar", InputAction::ToggleSidebar)]
     #[case("/sb", InputAction::ToggleSidebar)]
-    #[case("/mute", InputAction::ToggleMute)]
+    #[case("/mute", InputAction::ToggleMute(None))]
     #[case("/settings", InputAction::Settings)]
     #[case("/attach", InputAction::Attach)]
     #[case("/a", InputAction::Attach)]

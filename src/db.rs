@@ -226,6 +226,17 @@ impl Database {
             )?;
         }
 
+        if version < 13 {
+            self.conn.execute_batch(
+                "
+                BEGIN;
+                ALTER TABLE conversations ADD COLUMN mute_expiry INTEGER NOT NULL DEFAULT 0;
+                UPDATE schema_version SET version = 13;
+                COMMIT;
+                ",
+            )?;
+        }
+
         Ok(())
     }
 
@@ -781,22 +792,63 @@ impl Database {
 
     // --- Muted conversations ---
 
-    pub fn set_muted(&self, conv_id: &str, muted: bool) -> Result<()> {
+    /// Set mute state with optional expiry timestamp (0 = permanent mute).
+    /// `expiry_ms` is the Unix timestamp in milliseconds when the mute should expire.
+    pub fn set_mute_expiry(&self, conv_id: &str, expiry_ms: i64) -> Result<()> {
+        let muted = expiry_ms > 0 || expiry_ms == i64::MAX; // 0 = unmute, >0 or MAX = muted
         self.conn.execute(
-            "UPDATE conversations SET muted = ?2 WHERE id = ?1",
-            params![conv_id, muted as i32],
+            "UPDATE conversations SET muted = ?2, mute_expiry = ?3 WHERE id = ?1",
+            params![conv_id, muted as i32, expiry_ms],
         )?;
         Ok(())
     }
 
-    pub fn load_muted(&self) -> Result<std::collections::HashSet<String>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id FROM conversations WHERE muted = 1")?;
-        let ids: Vec<String> = stmt
-            .query_map([], |row| row.get(0))?
+    /// Load muted conversations that haven't expired yet.
+    /// Returns (conversation_id, expiry_ms) tuples.
+    /// expiry_ms = 0 means permanent mute (no expiry).
+    pub fn load_muted(&self) -> Result<Vec<(String, i64)>> {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let mut stmt = self.conn.prepare(
+            "SELECT id, mute_expiry FROM conversations 
+             WHERE muted = 1 
+             AND (mute_expiry = 0 OR mute_expiry > ?1)",
+        )?;
+        let rows: Vec<(String, i64)> = stmt
+            .query_map(params![now_ms], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(ids.into_iter().collect())
+        Ok(rows)
+    }
+
+    /// Check if a conversation is currently muted (considering expiry).
+    pub fn is_muted(&self, conv_id: &str) -> Result<Option<i64>> {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let result: Option<(i32, i64)> = self
+            .conn
+            .query_row(
+                "SELECT muted, mute_expiry FROM conversations WHERE id = ?1",
+                params![conv_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .ok();
+
+        match result {
+            Some((muted, expiry_ms)) if muted != 0 => {
+                // Check if expired
+                if expiry_ms > 0 && expiry_ms < now_ms {
+                    // Expired - auto-unmute
+                    self.conn
+                        .execute(
+                            "UPDATE conversations SET muted = 0 WHERE id = ?1",
+                            params![conv_id],
+                        )
+                        .ok();
+                    Ok(None)
+                } else {
+                    Ok(Some(expiry_ms))
+                }
+            }
+            _ => Ok(None),
+        }
     }
 
     // --- Blocked conversations ---
@@ -1085,13 +1137,9 @@ mod tests {
         assert_eq!(order[1], "+1");
     }
 
-    // --- Boolean flag round-trips: muted + blocked share identical structure ---
+    // --- Boolean flag round-trips: blocked ---
 
     #[rstest]
-    #[case("muted",
-        Database::set_muted as fn(&Database, &str, bool) -> anyhow::Result<()>,
-        Database::load_muted as fn(&Database) -> anyhow::Result<std::collections::HashSet<String>>
-    )]
     #[case("blocked",
         Database::set_blocked as fn(&Database, &str, bool) -> anyhow::Result<()>,
         Database::load_blocked as fn(&Database) -> anyhow::Result<std::collections::HashSet<String>>
