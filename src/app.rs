@@ -6174,30 +6174,9 @@ impl App {
                     }
                 }
             }
-            InputAction::ToggleMute => {
-                if let Some(ref conv_id) = self.active_conversation {
-                    let conv_id = conv_id.clone();
-                    if self.muted_conversations.remove(&conv_id) {
-                        let name = self
-                            .conversations
-                            .get(&conv_id)
-                            .map(|c| c.name.as_str())
-                            .unwrap_or(&conv_id);
-                        self.status_message = format!("unmuted {name}");
-                        db_warn(self.db.set_muted(&conv_id, false), "set_muted");
-                    } else {
-                        let name = self
-                            .conversations
-                            .get(&conv_id)
-                            .map(|c| c.name.as_str())
-                            .unwrap_or(&conv_id);
-                        self.status_message = format!("muted {name}");
-                        self.muted_conversations.insert(conv_id.clone());
-                        db_warn(self.db.set_muted(&conv_id, true), "set_muted");
-                    }
-                } else {
-                    self.status_message = "no active conversation to mute".to_string();
-                }
+            InputAction::Mute(_opt_duration) => {
+                // TODO: full implementation in Task 5
+                todo!()
             }
             InputAction::Block => {
                 if let Some(ref conv_id) = self.active_conversation {
