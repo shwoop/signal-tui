@@ -753,7 +753,25 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
             }
 
             // Conversation name
-            let is_muted = app.muted_conversations.contains(id);
+            let is_muted = app.muted_conversations.contains_key(id);
+            let mute_expiry = app.muted_conversations.get(id).copied().flatten();
+            
+            // Calculate remaining time if muted with expiry
+            let mute_remaining = if let Some(expiry_ms) = mute_expiry {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as i64;
+                if expiry_ms > now_ms {
+                    let remaining_secs = (expiry_ms - now_ms) / 1000;
+                    Some(remaining_secs)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            
             let name_style = if is_active {
                 Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)
             } else if has_unread {
@@ -773,7 +791,19 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
             }
 
             if is_muted {
-                spans.push(Span::styled(" ~", Style::default().fg(theme.fg_muted)));
+                let mute_indicator = if let Some(remaining_secs) = mute_remaining {
+                    // Format remaining time
+                    if remaining_secs >= 3600 {
+                        format!(" ~{}h", remaining_secs / 3600)
+                    } else if remaining_secs >= 60 {
+                        format!(" ~{}m", remaining_secs / 60)
+                    } else {
+                        format!(" ~{}s", remaining_secs)
+                    }
+                } else {
+                    " ~".to_string()
+                };
+                spans.push(Span::styled(mute_indicator, Style::default().fg(theme.fg_muted)));
             }
             if app.blocked_conversations.contains(id) {
                 spans.push(Span::styled(" x", Style::default().fg(theme.error)));

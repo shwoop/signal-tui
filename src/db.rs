@@ -226,6 +226,17 @@ impl Database {
             )?;
         }
 
+        if version < 13 {
+            self.conn.execute_batch(
+                "
+                BEGIN;
+                ALTER TABLE conversations ADD COLUMN mute_expiry INTEGER;
+                UPDATE schema_version SET version = 13;
+                COMMIT;
+                ",
+            )?;
+        }
+
         Ok(())
     }
 
@@ -781,22 +792,44 @@ impl Database {
 
     // --- Muted conversations ---
 
-    pub fn set_muted(&self, conv_id: &str, muted: bool) -> Result<()> {
+    /// Set mute state with optional expiry timestamp (in milliseconds since epoch).
+    /// If expiry is None, the mute is permanent.
+    pub fn set_muted(&self, conv_id: &str, muted: bool, expiry: Option<i64>) -> Result<()> {
         self.conn.execute(
-            "UPDATE conversations SET muted = ?2 WHERE id = ?1",
-            params![conv_id, muted as i32],
+            "UPDATE conversations SET muted = ?2, mute_expiry = ?3 WHERE id = ?1",
+            params![conv_id, muted as i32, expiry],
         )?;
         Ok(())
     }
 
-    pub fn load_muted(&self) -> Result<std::collections::HashSet<String>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id FROM conversations WHERE muted = 1")?;
-        let ids: Vec<String> = stmt
-            .query_map([], |row| row.get(0))?
+    /// Load muted conversations, filtering out expired mutes and auto-unmuting them.
+    /// Returns (conv_id, expiry_or_none) tuples for currently muted conversations.
+    pub fn load_muted(&self, now_ms: i64) -> Result<std::collections::HashMap<String, Option<i64>>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, mute_expiry FROM conversations WHERE muted = 1",
+        )?;
+        
+        let rows: Vec<(String, Option<i64>)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(ids.into_iter().collect())
+        
+        let mut result = std::collections::HashMap::new();
+        for (id, expiry) in rows {
+            // Skip expired mutes
+            if let Some(expiry_ms) = expiry {
+                if expiry_ms <= now_ms {
+                    // Auto-unmute expired conversations
+                    self.conn.execute(
+                        "UPDATE conversations SET muted = 0, mute_expiry = NULL WHERE id = ?1",
+                        params![id],
+                    )?;
+                    continue;
+                }
+            }
+            result.insert(id, expiry);
+        }
+        
+        Ok(result)
     }
 
     // --- Blocked conversations ---
@@ -1085,13 +1118,9 @@ mod tests {
         assert_eq!(order[1], "+1");
     }
 
-    // --- Boolean flag round-trips: muted + blocked share identical structure ---
+    // --- Boolean flag round-trip: blocked ---
 
     #[rstest]
-    #[case("muted",
-        Database::set_muted as fn(&Database, &str, bool) -> anyhow::Result<()>,
-        Database::load_muted as fn(&Database) -> anyhow::Result<std::collections::HashSet<String>>
-    )]
     #[case("blocked",
         Database::set_blocked as fn(&Database, &str, bool) -> anyhow::Result<()>,
         Database::load_blocked as fn(&Database) -> anyhow::Result<std::collections::HashSet<String>>
@@ -1471,5 +1500,61 @@ mod tests {
         // Most recent first
         assert_eq!(results[0].3, "+2"); // Bob's conversation
         assert_eq!(results[1].3, "+1"); // Alice's conversation
+    }
+
+    #[rstest]
+    fn mute_with_expiry_round_trip(db: Database) {
+        db.upsert_conversation("+1", "Alice", false).unwrap();
+        db.upsert_conversation("+2", "Bob", false).unwrap();
+
+        let now_ms = 1_000_000_000i64;
+        let expiry_ms = now_ms + 3600_000; // 1 hour from now
+
+        // Set muted with expiry
+        db.set_muted("+1", true, Some(expiry_ms)).unwrap();
+        
+        let muted = db.load_muted(now_ms).unwrap();
+        assert!(muted.contains_key("+1"));
+        assert_eq!(muted.get("+1"), Some(&Some(expiry_ms)));
+        assert!(!muted.contains_key("+2"));
+
+        // Set permanent mute (no expiry)
+        db.set_muted("+2", true, None).unwrap();
+        
+        let muted = db.load_muted(now_ms).unwrap();
+        assert!(muted.contains_key("+2"));
+        assert_eq!(muted.get("+2"), Some(&None));
+    }
+
+    #[rstest]
+    fn mute_expiry_auto_unmutes(db: Database) {
+        db.upsert_conversation("+1", "Alice", false).unwrap();
+
+        let now_ms = 1_000_000_000i64;
+        let past_expiry_ms = now_ms - 1_000; // Already expired
+
+        // Set muted with past expiry
+        db.set_muted("+1", true, Some(past_expiry_ms)).unwrap();
+        
+        // Loading should auto-unmute expired conversations
+        let muted = db.load_muted(now_ms).unwrap();
+        assert!(!muted.contains_key("+1"));
+    }
+
+    #[rstest]
+    fn mute_unmute_round_trip(db: Database) {
+        db.upsert_conversation("+1", "Alice", false).unwrap();
+
+        let now_ms = 1_000_000_000i64;
+
+        // Mute
+        db.set_muted("+1", true, None).unwrap();
+        let muted = db.load_muted(now_ms).unwrap();
+        assert!(muted.contains_key("+1"));
+
+        // Unmute
+        db.set_muted("+1", false, None).unwrap();
+        let muted = db.load_muted(now_ms).unwrap();
+        assert!(!muted.contains_key("+1"));
     }
 }
