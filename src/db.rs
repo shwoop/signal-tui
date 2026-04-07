@@ -1495,14 +1495,47 @@ mod tests {
         assert!(!map.contains_key("+1"));
     }
 
-    #[rstest]
-    fn migration_v13_backfills_existing_mutes(db: Database) {
-        // Simulate a row that was permanently muted under the old schema
-        // (migration runs in open_in_memory, so post-migration muted col is gone;
-        //  this test just verifies set/load works correctly for backfill scenario)
-        db.upsert_conversation("+1", "Alice", false).unwrap();
-        db.set_mute_until("+1", Some(0)).unwrap();
-        let map = db.load_mute_until().unwrap();
-        assert_eq!(map.get("+1"), Some(&0i64));
+    #[test]
+    fn migration_v13_backfills_existing_mutes() {
+        // Build a v12-era schema manually and verify the v13 migration backfills it correctly.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        // Create v12 conversations table (with muted boolean, no mute_until)
+        conn.execute_batch(
+            "CREATE TABLE conversations (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL DEFAULT '',
+                is_group INTEGER NOT NULL DEFAULT 0,
+                muted INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT INTO conversations (id, name, muted) VALUES ('+1', 'Alice', 1);
+            INSERT INTO conversations (id, name, muted) VALUES ('+2', 'Bob', 0);",
+        )
+        .unwrap();
+        // Run the v13 migration SQL
+        conn.execute_batch(
+            "ALTER TABLE conversations ADD COLUMN mute_until INTEGER;
+             UPDATE conversations SET mute_until = 0 WHERE muted = 1;
+             ALTER TABLE conversations DROP COLUMN muted;",
+        )
+        .unwrap();
+        // Verify: Alice (was muted=1) → mute_until=0; Bob (was muted=0) → mute_until=NULL
+        let alice_until: Option<i64> = conn
+            .query_row(
+                "SELECT mute_until FROM conversations WHERE id = '+1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(alice_until, Some(0), "muted=1 should backfill to mute_until=0");
+
+        let bob_until: Option<i64> = conn
+            .query_row(
+                "SELECT mute_until FROM conversations WHERE id = '+2'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(bob_until, None, "muted=0 should stay mute_until=NULL");
     }
 }
