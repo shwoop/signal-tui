@@ -215,19 +215,26 @@ pub enum InputAction {
 }
 
 /// Parse a mute duration string like "1h", "8h", "1d", "1w" → seconds.
-/// Returns None if the format is invalid.
+/// Returns None if the format is invalid or the value is zero.
 fn parse_mute_duration(s: &str) -> Option<u64> {
     if s.is_empty() {
         return None;
     }
-    let (num_str, suffix) = s.split_at(s.len() - 1);
+    let s = s.trim().to_lowercase();
+    let (num_str, multiplier) = if let Some(n) = s.strip_suffix('h') {
+        (n, 3_600u64)
+    } else if let Some(n) = s.strip_suffix('d') {
+        (n, 86_400u64)
+    } else if let Some(n) = s.strip_suffix('w') {
+        (n, 7 * 86_400u64)
+    } else {
+        return None;
+    };
     let n: u64 = num_str.parse().ok()?;
-    match suffix {
-        "h" => Some(n * 3_600),
-        "d" => Some(n * 86_400),
-        "w" => Some(n * 7 * 86_400),
-        _ => None,
+    if n == 0 {
+        return None;
     }
+    Some(n * multiplier)
 }
 
 /// Parse a line of input into an action
@@ -557,6 +564,14 @@ mod tests {
         match parse_input("/mute 2x") {
             InputAction::Unknown(_) => {}
             other => panic!("expected Unknown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mute_zero_duration_returns_unknown() {
+        match parse_input("/mute 0h") {
+            InputAction::Unknown(_) => {}
+            other => panic!("expected Unknown for zero duration, got {other:?}"),
         }
     }
 

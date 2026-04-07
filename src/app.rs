@@ -6174,7 +6174,7 @@ impl App {
                     }
                 }
             }
-            InputAction::ToggleMute => {
+            InputAction::Mute(opt_secs) => {
                 if let Some(ref conv_id) = self.active_conversation {
                     let conv_id = conv_id.clone();
                     if self.muted_conversations.remove(&conv_id) {
@@ -6193,7 +6193,7 @@ impl App {
                             .unwrap_or(&conv_id);
                         self.status_message = format!("muted {name}");
                         self.muted_conversations.insert(conv_id.clone());
-                        db_warn(self.db.set_mute_until(&conv_id, Some(0)), "set_mute_until"); // TODO(mute_until)
+                        db_warn(self.db.set_mute_until(&conv_id, Some(opt_secs.unwrap_or(0) as i64)), "set_mute_until"); // TODO(mute_until)
                     }
                 } else {
                     self.status_message = "no active conversation to mute".to_string();
