@@ -69,6 +69,16 @@ fn db_warn<T>(result: Result<T, impl std::fmt::Display>, context: &str) {
     }
 }
 
+fn format_mute_duration(secs: u64) -> String {
+    if secs >= 7 * 86_400 {
+        format!("{}w", secs / (7 * 86_400))
+    } else if secs >= 86_400 {
+        format!("{}d", secs / 86_400)
+    } else {
+        format!("{}h", secs / 3_600)
+    }
+}
+
 impl App {
     /// Like `db_warn` but also surfaces the error in the status bar so the user sees it.
     fn db_warn_visible<T>(&mut self, result: Result<T, impl std::fmt::Display>, context: &str) {
@@ -6193,7 +6203,6 @@ impl App {
                             .get(&conv_id)
                             .map(|c| c.name.as_str())
                             .unwrap_or(&conv_id);
-                        self.status_message = format!("muted {name}");
                         let expiry: i64 = match opt_secs {
                             None => 0, // permanent
                             Some(secs) => {
@@ -6202,6 +6211,13 @@ impl App {
                                     .unwrap_or_default()
                                     .as_secs() as i64;
                                 now + secs as i64
+                            }
+                        };
+                        self.status_message = match opt_secs {
+                            None => format!("muted {name}"),
+                            Some(secs) => {
+                                let label = format_mute_duration(secs);
+                                format!("muted {name} for {label}")
                             }
                         };
                         self.muted_conversations.insert(conv_id.clone(), expiry);
