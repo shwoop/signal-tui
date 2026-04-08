@@ -43,6 +43,25 @@ const PROFILE_POPUP_WIDTH: u16 = 50;
 const EMOJI_POPUP_WIDTH: u16 = 52;
 const EMOJI_POPUP_HEIGHT: u16 = 20;
 
+/// Returns a short mute indicator string for the sidebar.
+/// - `until == 0`: permanent mute → "~"
+/// - `until > 0`: timed mute → remaining time as "~Xm", "~Xh", or "~Xd"
+///
+/// `now` and `until` are Unix epoch seconds.
+fn mute_remaining_label(until: i64, now: i64) -> String {
+    if until == 0 {
+        return "~".to_string();
+    }
+    let remaining = (until - now).max(0) as u64;
+    if remaining < 3_600 {
+        format!("~{}m", remaining / 60)
+    } else if remaining < 86_400 {
+        format!("~{}h", remaining / 3_600)
+    } else {
+        format!("~{}d", remaining / 86_400)
+    }
+}
+
 /// Convert emoji in a string to text emoticons or :shortcodes:.
 /// Common emoji get classic emoticons (e.g. :) <3), others get :shortcode: format.
 fn emoji_to_text(input: &str) -> String {
@@ -711,6 +730,11 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
             .collect()
     };
 
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
     let items: Vec<ListItem> = display_order
         .iter()
         .map(|id| {
@@ -753,7 +777,12 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
             }
 
             // Conversation name
-            let is_muted = app.muted_conversations.contains(id);
+            let mute_until = app.muted_conversations.get(id).copied();
+            let is_muted = match mute_until {
+                None => false,
+                Some(0) => true,
+                Some(ts) => now_secs < ts,
+            };
             let name_style = if is_active {
                 Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)
             } else if has_unread {
@@ -772,8 +801,9 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
                 ));
             }
 
-            if is_muted {
-                spans.push(Span::styled(" ~", Style::default().fg(theme.fg_muted)));
+            if let Some(until) = mute_until.filter(|_| is_muted) {
+                let label = format!(" {}", mute_remaining_label(until, now_secs));
+                spans.push(Span::styled(label, Style::default().fg(theme.fg_muted)));
             }
             if app.blocked_conversations.contains(id) {
                 spans.push(Span::styled(" x", Style::default().fg(theme.error)));
@@ -2883,7 +2913,7 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
         ("/search <query>", "Search messages"),
         ("/sidebar", "Toggle sidebar visibility"),
         ("/bell [type]", "Toggle notifications"),
-        ("/mute", "Mute/unmute conversation"),
+        ("/mute [duration]", "Mute/unmute conversation (e.g. 1h, 1d, 1w)"),
         ("/contacts", "Browse contacts"),
         ("/settings", "Open settings"),
         ("/keybindings", "Configure keybindings"),
@@ -4827,6 +4857,34 @@ mod tests {
     #[case(1_073_741_824, "1.0G")]
     fn format_file_size_cases(#[case] bytes: u64, #[case] expected: &str) {
         assert_eq!(format_file_size(bytes), expected);
+    }
+
+    // --- mute_remaining_label ---
+
+    #[test]
+    fn mute_remaining_label_formatting() {
+        // permanent mute (until == 0) → always "~"
+        assert_eq!(mute_remaining_label(0, 0), "~");
+        assert_eq!(mute_remaining_label(0, 999999), "~");
+
+        // timed: remaining < 1 hour → show minutes
+        // until=1060, now=1000 → remaining=60s → 1m
+        assert_eq!(mute_remaining_label(1060, 1000), "~1m");
+        // until=4599, now=1000 → remaining=3599s → 59m
+        assert_eq!(mute_remaining_label(4599, 1000), "~59m");
+        // until=4600, now=1000 → remaining=3600s = exactly 1h → show hours
+        assert_eq!(mute_remaining_label(4600, 1000), "~1h");
+
+        // timed: remaining >= 1 hour, < 24 hours → show hours
+        // until=8200, now=1000 → remaining=7200s → 2h
+        assert_eq!(mute_remaining_label(8200, 1000), "~2h");
+
+        // timed: remaining >= 24 hours → show days
+        // until=200000, now=1000 → remaining=199000s → 55h → 2d
+        assert_eq!(mute_remaining_label(200000, 1000), "~2d");
+
+        // expired (until <= now) → remaining=0 → "~0m"
+        assert_eq!(mute_remaining_label(500, 1000), "~0m");
     }
 
     // --- search_snippet ---
