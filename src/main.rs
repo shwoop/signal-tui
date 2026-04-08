@@ -1402,9 +1402,10 @@ async fn run_app(
             backend.dispatch(&mut app, typing_stop).await;
         }
 
-        // Periodic sweep of expired disappearing messages (every 10s)
+        // Periodic sweep of expired disappearing messages and timed mutes (every 10s)
         if last_expiry_sweep.elapsed() >= Duration::from_secs(10) {
             app.sweep_expired_messages();
+            app.sweep_expired_mutes();
             last_expiry_sweep = Instant::now();
             needs_redraw = true;
         }

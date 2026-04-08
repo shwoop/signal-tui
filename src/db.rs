@@ -226,6 +226,17 @@ impl Database {
             )?;
         }
 
+        if version < 13 {
+            self.conn.execute_batch(
+                "
+                BEGIN;
+                ALTER TABLE conversations ADD COLUMN mute_until_ts INTEGER NOT NULL DEFAULT 0;
+                UPDATE schema_version SET version = 13;
+                COMMIT;
+                ",
+            )?;
+        }
+
         Ok(())
     }
 
@@ -781,22 +792,26 @@ impl Database {
 
     // --- Muted conversations ---
 
-    pub fn set_muted(&self, conv_id: &str, muted: bool) -> Result<()> {
+    pub fn set_muted(&self, conv_id: &str, muted: bool, until_ts_ms: Option<i64>) -> Result<()> {
         self.conn.execute(
-            "UPDATE conversations SET muted = ?2 WHERE id = ?1",
-            params![conv_id, muted as i32],
+            "UPDATE conversations SET muted = ?2, mute_until_ts = ?3 WHERE id = ?1",
+            params![conv_id, muted as i32, until_ts_ms.unwrap_or(0)],
         )?;
         Ok(())
     }
 
-    pub fn load_muted(&self) -> Result<std::collections::HashSet<String>> {
+    pub fn load_muted(&self) -> Result<HashMap<String, Option<i64>>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id FROM conversations WHERE muted = 1")?;
-        let ids: Vec<String> = stmt
-            .query_map([], |row| row.get(0))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(ids.into_iter().collect())
+            .prepare("SELECT id, mute_until_ts FROM conversations WHERE muted = 1")?;
+        let entries = stmt
+            .query_map([], |row| {
+                let id: String = row.get(0)?;
+                let until: i64 = row.get(1)?;
+                Ok((id, if until == 0 { None } else { Some(until) }))
+            })?
+            .collect::<std::result::Result<HashMap<_, _>, _>>()?;
+        Ok(entries)
     }
 
     // --- Blocked conversations ---
@@ -1085,33 +1100,45 @@ mod tests {
         assert_eq!(order[1], "+1");
     }
 
-    // --- Boolean flag round-trips: muted + blocked share identical structure ---
+    // --- Muted round-trip (permanent and timed) ---
 
     #[rstest]
-    #[case("muted",
-        Database::set_muted as fn(&Database, &str, bool) -> anyhow::Result<()>,
-        Database::load_muted as fn(&Database) -> anyhow::Result<std::collections::HashSet<String>>
-    )]
-    #[case("blocked",
-        Database::set_blocked as fn(&Database, &str, bool) -> anyhow::Result<()>,
-        Database::load_blocked as fn(&Database) -> anyhow::Result<std::collections::HashSet<String>>
-    )]
-    fn boolean_flag_round_trip(
-        db: Database,
-        #[case] _label: &str,
-        #[case] setter: fn(&Database, &str, bool) -> anyhow::Result<()>,
-        #[case] loader: fn(&Database) -> anyhow::Result<std::collections::HashSet<String>>,
-    ) {
+    fn muted_round_trip(db: Database) {
         db.upsert_conversation("+1", "Alice", false).unwrap();
         db.upsert_conversation("+2", "Bob", false).unwrap();
 
-        setter(&db, "+1", true).unwrap();
-        let set = loader(&db).unwrap();
+        // Permanent mute
+        db.set_muted("+1", true, None).unwrap();
+        let map = db.load_muted().unwrap();
+        assert!(map.contains_key("+1"));
+        assert_eq!(map["+1"], None);
+        assert!(!map.contains_key("+2"));
+
+        // Timed mute
+        db.set_muted("+1", true, Some(9_999_999_999_000)).unwrap();
+        let map = db.load_muted().unwrap();
+        assert_eq!(map["+1"], Some(9_999_999_999_000));
+
+        // Unmute
+        db.set_muted("+1", false, None).unwrap();
+        let map = db.load_muted().unwrap();
+        assert!(!map.contains_key("+1"));
+    }
+
+    // --- Blocked round-trip ---
+
+    #[rstest]
+    fn blocked_round_trip(db: Database) {
+        db.upsert_conversation("+1", "Alice", false).unwrap();
+        db.upsert_conversation("+2", "Bob", false).unwrap();
+
+        db.set_blocked("+1", true).unwrap();
+        let set = db.load_blocked().unwrap();
         assert!(set.contains("+1"));
         assert!(!set.contains("+2"));
 
-        setter(&db, "+1", false).unwrap();
-        let set = loader(&db).unwrap();
+        db.set_blocked("+1", false).unwrap();
+        let set = db.load_blocked().unwrap();
         assert!(!set.contains("+1"));
     }
 

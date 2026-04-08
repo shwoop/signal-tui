@@ -34,8 +34,8 @@ pub const COMMANDS: &[CommandInfo] = &[
     CommandInfo {
         name: "/mute",
         alias: "",
-        args: "",
-        description: "Mute/unmute current chat",
+        args: "[duration]",
+        description: "Mute/unmute chat (e.g. /mute 1h)",
     },
     CommandInfo {
         name: "/block",
@@ -168,8 +168,8 @@ pub enum InputAction {
     ToggleSidebar,
     /// Toggle terminal bell notifications (None = both, Some("direct"/"group") = specific)
     ToggleBell(Option<String>),
-    /// Mute/unmute the current conversation
-    ToggleMute,
+    /// Mute/unmute the current conversation (None = toggle permanent, Some = timed duration)
+    Mute(Option<String>),
     /// Block the current contact/group
     Block,
     /// Unblock the current contact/group
@@ -251,7 +251,13 @@ pub fn parse_input(input: &str) -> InputAction {
                 InputAction::ToggleBell(Some(arg))
             }
         }
-        "/mute" => InputAction::ToggleMute,
+        "/mute" => {
+            if arg.is_empty() {
+                InputAction::Mute(None)
+            } else {
+                InputAction::Mute(Some(arg))
+            }
+        }
         "/block" => InputAction::Block,
         "/unblock" => InputAction::Unblock,
         "/attach" | "/a" => InputAction::Attach,
@@ -453,7 +459,7 @@ mod tests {
     #[case("/q", InputAction::Quit)]
     #[case("/sidebar", InputAction::ToggleSidebar)]
     #[case("/sb", InputAction::ToggleSidebar)]
-    #[case("/mute", InputAction::ToggleMute)]
+    #[case("/mute", InputAction::Mute(None))]
     #[case("/settings", InputAction::Settings)]
     #[case("/attach", InputAction::Attach)]
     #[case("/a", InputAction::Attach)]
@@ -493,6 +499,9 @@ mod tests {
     #[case("/notify group", InputAction::ToggleBell(Some("group".to_string())))]
     #[case("/emoji smile", InputAction::Emoji("smile".to_string()))]
     #[case("/e rocket", InputAction::Emoji("rocket".to_string()))]
+    #[case("/mute 1h", InputAction::Mute(Some("1h".to_string())))]
+    #[case("/mute 8h", InputAction::Mute(Some("8h".to_string())))]
+    #[case("/mute 1d", InputAction::Mute(Some("1d".to_string())))]
     fn command_with_argument(#[case] input: &str, #[case] expected: InputAction) {
         assert_eq!(parse_input(input), expected);
     }
