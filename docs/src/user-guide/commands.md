@@ -14,7 +14,7 @@ All commands start with `/`. Type `/` in Insert mode to open the autocomplete po
 | `/export` | | `[n]` | Export chat history to plain text file |
 | `/sidebar` | `/sb` | | Toggle sidebar visibility |
 | `/bell` | `/notify` | `[type]` | Toggle notifications (`direct`, `group`, or both) |
-| `/mute` | | | Mute/unmute current conversation |
+| `/mute` | | `[duration]` | Mute/unmute current conversation (optional: `1h`, `8h`, `1d`, `1w`) |
 | `/block` | | | Block current contact or group |
 | `/unblock` | | | Unblock current contact or group |
 | `/disappearing` | `/dm` | `<duration>` | Set disappearing message timer (`off`, `30s`, `5m`, `1h`, `1d`, `1w`) |
@@ -73,6 +73,17 @@ complete the selection.
 ```
 /mute
 ```
+
+**Mute for a specific duration:**
+```
+/mute 1h
+/mute 8h
+/mute 1d
+/mute 1w
+```
+
+Timed mutes show remaining time in the sidebar (e.g. `~2h`) and auto-unmute
+when they expire.
 
 **Search for a message:**
 ```

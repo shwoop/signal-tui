@@ -226,6 +226,17 @@ impl Database {
             )?;
         }
 
+        if version < 13 {
+            self.conn.execute_batch(
+                "
+                BEGIN;
+                ALTER TABLE conversations ADD COLUMN mute_expires_at INTEGER;
+                UPDATE schema_version SET version = 13;
+                COMMIT;
+                ",
+            )?;
+        }
+
         Ok(())
     }
 
@@ -781,22 +792,50 @@ impl Database {
 
     // --- Muted conversations ---
 
-    pub fn set_muted(&self, conv_id: &str, muted: bool) -> Result<()> {
-        self.conn.execute(
-            "UPDATE conversations SET muted = ?2 WHERE id = ?1",
-            params![conv_id, muted as i32],
-        )?;
+    pub fn set_muted(&self, conv_id: &str, muted: bool, expires_at: Option<i64>) -> Result<()> {
+        if muted {
+            self.conn.execute(
+                "UPDATE conversations SET muted = 1, mute_expires_at = ?2 WHERE id = ?1",
+                params![conv_id, expires_at],
+            )?;
+        } else {
+            self.conn.execute(
+                "UPDATE conversations SET muted = 0, mute_expires_at = NULL WHERE id = ?1",
+                params![conv_id],
+            )?;
+        }
         Ok(())
     }
 
-    pub fn load_muted(&self) -> Result<std::collections::HashSet<String>> {
+    /// Clear expired timed mutes from the database.
+    /// Returns the number of conversations that were auto-unmuted.
+    pub fn clear_expired_mutes(&self) -> Result<usize> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let rows = self.conn.execute(
+            "UPDATE conversations SET muted = 0, mute_expires_at = NULL \
+             WHERE muted = 1 AND mute_expires_at IS NOT NULL AND mute_expires_at <= ?1",
+            params![now_ms],
+        )?;
+        Ok(rows)
+    }
+
+    pub fn load_muted(&self) -> Result<std::collections::HashMap<String, Option<i64>>> {
+        self.clear_expired_mutes()?;
         let mut stmt = self
             .conn
-            .prepare("SELECT id FROM conversations WHERE muted = 1")?;
-        let ids: Vec<String> = stmt
-            .query_map([], |row| row.get(0))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(ids.into_iter().collect())
+            .prepare("SELECT id, mute_expires_at FROM conversations WHERE muted = 1")?;
+        let rows: Vec<(String, Option<i64>)> = stmt
+            .query_map([], |row| {
+                let id: String = row.get(0)?;
+                let expires_at: Option<i64> = row.get(1)?;
+                Ok((id, expires_at))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows.into_iter().collect())
     }
 
     // --- Blocked conversations ---
@@ -1085,33 +1124,70 @@ mod tests {
         assert_eq!(order[1], "+1");
     }
 
-    // --- Boolean flag round-trips: muted + blocked share identical structure ---
+    // --- Muted / Blocked round-trips ---
 
     #[rstest]
-    #[case("muted",
-        Database::set_muted as fn(&Database, &str, bool) -> anyhow::Result<()>,
-        Database::load_muted as fn(&Database) -> anyhow::Result<std::collections::HashSet<String>>
-    )]
-    #[case("blocked",
-        Database::set_blocked as fn(&Database, &str, bool) -> anyhow::Result<()>,
-        Database::load_blocked as fn(&Database) -> anyhow::Result<std::collections::HashSet<String>>
-    )]
-    fn boolean_flag_round_trip(
+    fn set_muted_round_trip(db: Database) {
+        db.upsert_conversation("+1", "Alice", false).unwrap();
+        db.upsert_conversation("+2", "Bob", false).unwrap();
+
+        db.set_muted("+1", true, None).unwrap();
+        let mutes = db.load_muted().unwrap();
+        assert!(mutes.contains_key("+1"));
+        assert!(!mutes.contains_key("+2"));
+        assert!(mutes["+1"].is_none()); // permanent mute
+
+        db.set_muted("+1", false, None).unwrap();
+        let mutes = db.load_muted().unwrap();
+        assert!(!mutes.contains_key("+1"));
+    }
+
+    #[rstest]
+    fn set_timed_mute(db: Database) {
+        db.upsert_conversation("+1", "Alice", false).unwrap();
+        let future_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64 + 86_400_000; // 1 day from now
+
+        db.set_muted("+1", true, Some(future_ms)).unwrap();
+        let mutes = db.load_muted().unwrap();
+        assert!(mutes.contains_key("+1"));
+        assert_eq!(mutes["+1"], Some(future_ms));
+
+        db.set_muted("+1", false, None).unwrap();
+        let mutes = db.load_muted().unwrap();
+        assert!(!mutes.contains_key("+1"));
+    }
+
+    #[rstest]
+    fn timed_mute_expires(db: Database) {
+        db.upsert_conversation("+1", "Alice", false).unwrap();
+        let past_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64 - 1000; // 1 second ago
+
+        db.set_muted("+1", true, Some(past_ms)).unwrap();
+        // load_muted calls clear_expired_mutes internally
+        let mutes = db.load_muted().unwrap();
+        assert!(!mutes.contains_key("+1")); // expired, should be gone
+    }
+
+    #[rstest]
+    fn blocked_round_trip(
         db: Database,
-        #[case] _label: &str,
-        #[case] setter: fn(&Database, &str, bool) -> anyhow::Result<()>,
-        #[case] loader: fn(&Database) -> anyhow::Result<std::collections::HashSet<String>>,
     ) {
         db.upsert_conversation("+1", "Alice", false).unwrap();
         db.upsert_conversation("+2", "Bob", false).unwrap();
 
-        setter(&db, "+1", true).unwrap();
-        let set = loader(&db).unwrap();
+        db.set_blocked("+1", true).unwrap();
+        let set = db.load_blocked().unwrap();
         assert!(set.contains("+1"));
         assert!(!set.contains("+2"));
 
-        setter(&db, "+1", false).unwrap();
-        let set = loader(&db).unwrap();
+        db.set_blocked("+1", false).unwrap();
+        let set = db.load_blocked().unwrap();
         assert!(!set.contains("+1"));
     }
 
