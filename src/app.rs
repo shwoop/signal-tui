@@ -26,7 +26,7 @@ use crate::keybindings::{self, BindingMode, KeyAction, KeyBindings};
 use crate::list_overlay::{self, classify_list_key, ListKeyAction};
 use crate::mute::MuteState;
 use crate::signal::types::{
-    Contact, Group, IdentityInfo, MessageStatus, PollData, PollOption, PollVote, Reaction,
+    Contact, Group, IdentityInfo, Mention, MessageStatus, PollData, PollOption, PollVote, Reaction,
     SignalEvent, SignalMessage, StyleType, TrustLevel,
 };
 use crate::theme::{self, Theme};
@@ -189,6 +189,49 @@ pub struct PollVotePending {
     pub poll_timestamp: i64,
     pub allow_multiple: bool,
     pub options: Vec<PollOption>,
+}
+
+/// Tracks the initial sync burst when the app starts.
+/// During sync, notifications and viewport jumps are suppressed.
+pub struct SyncState {
+    /// Whether the sync burst is still considered active.
+    pub active: bool,
+    /// Number of messages received since sync started.
+    pub message_count: usize,
+    /// Time the most recent message arrived (None if no messages yet).
+    pub last_message_time: Option<Instant>,
+    /// Time when sync started (used to enforce a minimum quiet period).
+    pub started_at: Instant,
+    /// Notifications suppressed per conversation during sync (conv_id → count).
+    pub suppressed_notifications: HashMap<String, usize>,
+    /// True if the user manually scrolled the viewport during sync.
+    pub user_scrolled: bool,
+}
+
+impl SyncState {
+    pub fn new() -> Self {
+        Self {
+            active: true,
+            message_count: 0,
+            last_message_time: None,
+            started_at: Instant::now(),
+            suppressed_notifications: HashMap::new(),
+            user_scrolled: false,
+        }
+    }
+
+    /// Returns true when sync should end: at least 10 s have elapsed since start,
+    /// and either no messages have been received or the last one arrived >= 3 s ago.
+    pub fn should_end(&self) -> bool {
+        let elapsed = self.started_at.elapsed();
+        if elapsed.as_secs() < 10 {
+            return false;
+        }
+        match self.last_message_time {
+            None => true,
+            Some(last) => last.elapsed().as_secs() >= 3,
+        }
+    }
 }
 
 /// Application state
@@ -378,6 +421,8 @@ pub struct App {
     pub settings_profiles: SettingsProfileOverlayState,
     /// Mouse enabled state when settings overlay opened (for deferred toggle)
     pub settings_mouse_snapshot: bool,
+    /// Sync state: tracks the initial message burst on startup.
+    pub sync: SyncState,
 }
 
 pub const QUICK_REACTIONS: &[&str] = &[
@@ -814,8 +859,8 @@ impl App {
         }
 
         // Spawn background render tasks
-        let native_sixel = self.image.image_mode == "native"
-            && self.image.image_protocol == image_render::ImageProtocol::Sixel;
+        let is_native = self.image.image_mode == "native";
+        let is_sixel = self.image.image_protocol == image_render::ImageProtocol::Sixel;
         let cell_px = self.image.cell_px;
         for (ts, path, max_width, is_preview) in work {
             self.image
@@ -826,9 +871,10 @@ impl App {
             tokio::task::spawn_blocking(move || {
                 let lines = image_render::render_image(Path::new(&path), max_width);
 
-                // Pre-encode PNG + full Sixel alongside halfblock so caches are
-                // populated before the image first appears in the viewport.
-                let (pre_native_png, pre_sixel) = if native_sixel {
+                // Pre-encode PNG (all native protocols) and Sixel alongside halfblock
+                // so caches are populated before the image first appears in the viewport.
+                // Without this, Kitty/iTerm2 would encode synchronously on first scroll-in.
+                let (pre_native_png, pre_sixel) = if is_native {
                     let cell_w = lines
                         .as_ref()
                         .and_then(|l| l.first())
@@ -837,9 +883,18 @@ impl App {
                     let cell_h = lines.as_ref().map(|l| l.len() as u32).unwrap_or(0);
                     if cell_w > 0 && cell_h > 0 {
                         let png = image_render::encode_native_png(Path::new(&path), cell_w, cell_h);
-                        let sixel = png.as_ref().and_then(|p| {
-                            image_render::encode_sixel(&p.0, cell_w as u16, cell_h as u16, cell_px)
-                        });
+                        let sixel = if is_sixel {
+                            png.as_ref().and_then(|p| {
+                                image_render::encode_sixel(
+                                    &p.0,
+                                    cell_w as u16,
+                                    cell_h as u16,
+                                    cell_px,
+                                )
+                            })
+                        } else {
+                            None
+                        };
                         let pre_png = png.map(|(b64, pw, ph)| (path.clone(), b64, pw, ph));
                         let pre_six = sixel.map(|s| (path.clone(), s));
                         (pre_png, pre_six)
@@ -880,15 +935,11 @@ impl App {
             .unwrap_or(0);
 
         match code {
-            KeyCode::Char('j') | KeyCode::Down => {
-                if visual_pos + 1 < SETTINGS_VISUAL_ORDER.len() {
-                    self.settings_index = SETTINGS_VISUAL_ORDER[visual_pos + 1];
-                }
+            KeyCode::Char('j') | KeyCode::Down if visual_pos + 1 < SETTINGS_VISUAL_ORDER.len() => {
+                self.settings_index = SETTINGS_VISUAL_ORDER[visual_pos + 1];
             }
-            KeyCode::Char('k') | KeyCode::Up => {
-                if visual_pos > 0 {
-                    self.settings_index = SETTINGS_VISUAL_ORDER[visual_pos - 1];
-                }
+            KeyCode::Char('k') | KeyCode::Up if visual_pos > 0 => {
+                self.settings_index = SETTINGS_VISUAL_ORDER[visual_pos - 1];
             }
             KeyCode::Char(' ') | KeyCode::Enter | KeyCode::Tab => {
                 if self.settings_index == preview_index {
@@ -924,10 +975,8 @@ impl App {
     pub fn handle_customize_key(&mut self, code: KeyCode) {
         const ITEMS: usize = 3; // Theme, Keybindings, Profile
         match code {
-            KeyCode::Char('j') | KeyCode::Down => {
-                if self.customize_index + 1 < ITEMS {
-                    self.customize_index += 1;
-                }
+            KeyCode::Char('j') | KeyCode::Down if self.customize_index + 1 < ITEMS => {
+                self.customize_index += 1;
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 self.customize_index = self.customize_index.saturating_sub(1);
@@ -1036,10 +1085,8 @@ impl App {
                 KeyCode::Backspace => {
                     self.settings_profiles.save_as_input.pop();
                 }
-                KeyCode::Char(c) => {
-                    if self.settings_profiles.save_as_input.len() < 30 {
-                        self.settings_profiles.save_as_input.push(c);
-                    }
+                KeyCode::Char(c) if self.settings_profiles.save_as_input.len() < 30 => {
+                    self.settings_profiles.save_as_input.push(c);
                 }
                 _ => {}
             }
@@ -1048,12 +1095,11 @@ impl App {
 
         // List navigation mode
         match code {
-            KeyCode::Char('j') | KeyCode::Down => {
+            KeyCode::Char('j') | KeyCode::Down
                 if self.settings_profiles.index
-                    < self.settings_profiles.available.len().saturating_sub(1)
-                {
-                    self.settings_profiles.index += 1;
-                }
+                    < self.settings_profiles.available.len().saturating_sub(1) =>
+            {
+                self.settings_profiles.index += 1;
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 self.settings_profiles.index = self.settings_profiles.index.saturating_sub(1);
@@ -1170,12 +1216,11 @@ impl App {
             other => other,
         };
         match classify_list_key(code, false) {
-            ListKeyAction::Down => {
+            ListKeyAction::Down
                 if self.theme_picker.index
-                    < self.theme_picker.available_themes.len().saturating_sub(1)
-                {
-                    self.theme_picker.index += 1;
-                }
+                    < self.theme_picker.available_themes.len().saturating_sub(1) =>
+            {
+                self.theme_picker.index += 1;
             }
             ListKeyAction::Up => {
                 self.theme_picker.index = self.theme_picker.index.saturating_sub(1);
@@ -1202,16 +1247,15 @@ impl App {
     pub fn handle_keybindings_key(&mut self, code: KeyCode) {
         if self.keybindings_overlay.profile_picker {
             match code {
-                KeyCode::Char('j') | KeyCode::Down => {
+                KeyCode::Char('j') | KeyCode::Down
                     if self.keybindings_overlay.profile_index
                         < self
                             .keybindings_overlay
                             .available_profiles
                             .len()
-                            .saturating_sub(1)
-                    {
-                        self.keybindings_overlay.profile_index += 1;
-                    }
+                            .saturating_sub(1) =>
+                {
+                    self.keybindings_overlay.profile_index += 1;
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
                     self.keybindings_overlay.profile_index =
@@ -1440,7 +1484,7 @@ impl App {
             })
             .map(|(number, name)| (number.clone(), name.clone()))
             .collect();
-        contacts.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+        contacts.sort_by_key(|a| a.1.to_lowercase());
         self.contacts_overlay.filtered = contacts;
         list_overlay::clamp_index(
             &mut self.contacts_overlay.index,
@@ -1516,7 +1560,7 @@ impl App {
             })
             .map(|(number, name)| (number.clone(), name.clone()))
             .collect();
-        contacts.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+        contacts.sort_by_key(|a| a.1.to_lowercase());
         self.group_menu.filtered = contacts;
         if self.group_menu.filtered.is_empty() {
             self.group_menu.index = 0;
@@ -1554,7 +1598,7 @@ impl App {
                     || phone.to_lowercase().contains(&filter_lower)
             })
             .collect();
-        result.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+        result.sort_by_key(|a| a.1.to_lowercase());
         self.group_menu.filtered = result;
         if self.group_menu.filtered.is_empty() {
             self.group_menu.index = 0;
@@ -1571,10 +1615,10 @@ impl App {
                 let items = self.group_menu_items();
                 let item_count = items.len();
                 match code {
-                    KeyCode::Char('j') | KeyCode::Down => {
-                        if self.group_menu.index < item_count.saturating_sub(1) {
-                            self.group_menu.index += 1;
-                        }
+                    KeyCode::Char('j') | KeyCode::Down
+                        if self.group_menu.index < item_count.saturating_sub(1) =>
+                    {
+                        self.group_menu.index += 1;
                     }
                     KeyCode::Char('k') | KeyCode::Up => {
                         self.group_menu.index = self.group_menu.index.saturating_sub(1);
@@ -1608,10 +1652,10 @@ impl App {
             GroupMenuState::Members => {
                 let member_count = self.group_menu.filtered.len();
                 match code {
-                    KeyCode::Char('j') | KeyCode::Down => {
-                        if self.group_menu.index < member_count.saturating_sub(1) {
-                            self.group_menu.index += 1;
-                        }
+                    KeyCode::Char('j') | KeyCode::Down
+                        if self.group_menu.index < member_count.saturating_sub(1) =>
+                    {
+                        self.group_menu.index += 1;
                     }
                     KeyCode::Char('k') | KeyCode::Up => {
                         self.group_menu.index = self.group_menu.index.saturating_sub(1);
@@ -1626,12 +1670,11 @@ impl App {
             }
             GroupMenuState::AddMember => {
                 match code {
-                    KeyCode::Char('j') | KeyCode::Down => {
+                    KeyCode::Char('j') | KeyCode::Down
                         if !self.group_menu.filtered.is_empty()
-                            && self.group_menu.index < self.group_menu.filtered.len() - 1
-                        {
-                            self.group_menu.index += 1;
-                        }
+                            && self.group_menu.index < self.group_menu.filtered.len() - 1 =>
+                    {
+                        self.group_menu.index += 1;
                     }
                     KeyCode::Char('k') | KeyCode::Up => {
                         self.group_menu.index = self.group_menu.index.saturating_sub(1);
@@ -1671,12 +1714,11 @@ impl App {
             }
             GroupMenuState::RemoveMember => {
                 match code {
-                    KeyCode::Char('j') | KeyCode::Down => {
+                    KeyCode::Char('j') | KeyCode::Down
                         if !self.group_menu.filtered.is_empty()
-                            && self.group_menu.index < self.group_menu.filtered.len() - 1
-                        {
-                            self.group_menu.index += 1;
-                        }
+                            && self.group_menu.index < self.group_menu.filtered.len() - 1 =>
+                    {
+                        self.group_menu.index += 1;
                     }
                     KeyCode::Char('k') | KeyCode::Up => {
                         self.group_menu.index = self.group_menu.index.saturating_sub(1);
@@ -2818,6 +2860,7 @@ impl App {
                 ..Default::default()
             },
             settings_mouse_snapshot: true,
+            sync: SyncState::new(),
         }
     }
 
@@ -3063,6 +3106,53 @@ impl App {
         }
     }
 
+    /// End the initial sync burst. Snaps viewport, fires summary notification,
+    /// marks the active conversation read, and resets sync state.
+    pub fn end_sync(&mut self) {
+        self.sync.active = false;
+
+        // Snap viewport to newest messages (unless user manually scrolled)
+        if !self.sync.user_scrolled {
+            self.scroll_offset = 0;
+        }
+
+        // Fire summary notification if any were suppressed
+        let total: usize = self.sync.suppressed_notifications.values().sum();
+        let conv_count = self.sync.suppressed_notifications.len();
+        if total > 0 {
+            self.notifications.pending_bell = true;
+            if self.notifications.desktop_notifications {
+                let conv_word = if conv_count == 1 {
+                    "conversation"
+                } else {
+                    "conversations"
+                };
+                let body = format!("{total} new messages in {conv_count} {conv_word}");
+                show_desktop_notification("siggy", &body, false, None, "full");
+            }
+        }
+        self.sync.suppressed_notifications.clear();
+
+        // Send read receipts for messages that arrived during sync, then mark read
+        if let Some(conv_id) = self.active_conversation.clone() {
+            let read_from = self
+                .store
+                .last_read_index
+                .get(&conv_id)
+                .copied()
+                .unwrap_or(0);
+            self.queue_read_receipts_for_conv(&conv_id, read_from);
+        }
+        self.mark_read();
+
+        // Update status
+        self.status_message = if self.connected {
+            "connected".to_string()
+        } else {
+            "disconnected".to_string()
+        };
+    }
+
     /// Queue read receipts for unread incoming messages in a conversation.
     /// Messages from `start_index` onward are considered unread.
     /// Groups timestamps by sender and appends to `pending_read_receipts`.
@@ -3208,11 +3298,13 @@ impl App {
                 true
             }
             Some(KeyAction::PageScrollUp) => {
+                self.sync.user_scrolled = true;
                 self.scroll_offset = self.scroll_offset.saturating_add(5);
                 self.focused_msg_index = None;
                 true
             }
             Some(KeyAction::PageScrollDown) => {
+                self.sync.user_scrolled = true;
                 self.scroll_offset = self.scroll_offset.saturating_sub(5);
                 self.focused_msg_index = None;
                 true
@@ -3396,34 +3488,41 @@ impl App {
         {
             // Scroll
             Some(KeyAction::ScrollDown) => {
+                self.sync.user_scrolled = true;
                 self.scroll_offset = self.scroll_offset.saturating_sub(1);
                 self.focused_msg_index = None;
                 None
             }
             Some(KeyAction::ScrollUp) => {
+                self.sync.user_scrolled = true;
                 self.scroll_offset = self.scroll_offset.saturating_add(1);
                 self.focused_msg_index = None;
                 None
             }
             Some(KeyAction::FocusNextMessage) => {
+                self.sync.user_scrolled = true;
                 self.jump_to_adjacent_message(false);
                 None
             }
             Some(KeyAction::FocusPrevMessage) => {
+                self.sync.user_scrolled = true;
                 self.jump_to_adjacent_message(true);
                 None
             }
             Some(KeyAction::HalfPageDown) => {
+                self.sync.user_scrolled = true;
                 self.scroll_offset = self.scroll_offset.saturating_sub(10);
                 self.focused_msg_index = None;
                 None
             }
             Some(KeyAction::HalfPageUp) => {
+                self.sync.user_scrolled = true;
                 self.scroll_offset = self.scroll_offset.saturating_add(10);
                 self.focused_msg_index = None;
                 None
             }
             Some(KeyAction::ScrollToBottom) => {
+                self.sync.user_scrolled = true;
                 self.scroll_offset = 0;
                 self.focused_msg_index = None;
                 None
@@ -3707,11 +3806,13 @@ impl App {
             }
             // Actions that alternative profiles (Emacs/Minimal) may bind in Insert mode
             Some(KeyAction::ScrollDown) => {
+                self.sync.user_scrolled = true;
                 self.scroll_offset = self.scroll_offset.saturating_sub(1);
                 self.focused_msg_index = None;
                 None
             }
             Some(KeyAction::ScrollUp) => {
+                self.sync.user_scrolled = true;
                 self.scroll_offset = self.scroll_offset.saturating_add(1);
                 self.focused_msg_index = None;
                 None
@@ -4098,6 +4199,14 @@ impl App {
             self.refresh_sidebar_filter();
         }
 
+        // Track sync burst progress
+        if self.sync.active {
+            self.sync.message_count += 1;
+            self.sync.last_message_time = Some(Instant::now());
+            self.status_message =
+                format!("Syncing... ({} messages received)", self.sync.message_count);
+        }
+
         // Store source_name in contact lookup for future resolution (typing indicators, etc.)
         if !msg.is_outgoing {
             if let Some(ref name) = msg.source_name {
@@ -4252,7 +4361,9 @@ impl App {
                             image_path: Option<String>,
                             mention_ranges: Vec<(usize, usize)>,
                             style_ranges: Vec<(usize, usize, StyleType)>,
-                            quote: Option<Quote>| {
+                            quote: Option<Quote>,
+                            body_raw: Option<String>,
+                            mentions: Vec<Mention>| {
             // Check for buffered poll data from a race condition (poll event arrived first)
             let deferred_poll = self
                 .poll_vote
@@ -4276,6 +4387,8 @@ impl App {
                         reactions: Vec::new(),
                         mention_ranges,
                         style_ranges,
+                        body_raw: body_raw.clone(),
+                        mentions: mentions.clone(),
                         quote,
                         is_edited: false,
                         is_deleted: false,
@@ -4321,8 +4434,24 @@ impl App {
         };
 
         // Add text body (with resolved @mentions and text styles)
+        let had_mentions = !msg.mentions.is_empty();
         if let Some((resolved, ranges)) = resolved_body {
-            push_msg(resolved, None, None, ranges, resolved_styles, display_quote);
+            let raw_body_for_msg = if had_mentions { msg.body.clone() } else { None };
+            let mentions_for_msg = if had_mentions {
+                msg.mentions.clone()
+            } else {
+                Vec::new()
+            };
+            push_msg(
+                resolved,
+                None,
+                None,
+                ranges,
+                resolved_styles,
+                display_quote,
+                raw_body_for_msg,
+                mentions_for_msg,
+            );
         }
 
         // Add attachment notices
@@ -4351,6 +4480,8 @@ impl App {
                     Vec::new(),
                     Vec::new(),
                     None,
+                    None,
+                    Vec::new(),
                 );
             } else {
                 push_msg(
@@ -4360,6 +4491,20 @@ impl App {
                     Vec::new(),
                     Vec::new(),
                     None,
+                    None,
+                    Vec::new(),
+                );
+            }
+        }
+
+        // Persist raw body + mentions so the display body can be re-resolved
+        // later when the contact list or group list fills in unknown UUIDs.
+        if had_mentions {
+            if let Some(ref raw) = msg.body {
+                db_warn(
+                    self.db
+                        .upsert_message_mentions(&conv_id, msg_ts_ms, raw, &msg.mentions),
+                    "upsert_message_mentions",
                 );
             }
         }
@@ -4421,27 +4566,46 @@ impl App {
             } else {
                 self.notifications.notify_direct
             };
-            if type_enabled && not_muted_or_blocked {
-                self.notifications.pending_bell = true;
+            if self.sync.active {
+                if type_enabled && not_muted_or_blocked {
+                    *self
+                        .sync
+                        .suppressed_notifications
+                        .entry(conv_id.clone())
+                        .or_insert(0) += 1;
+                }
+            } else {
+                if type_enabled && not_muted_or_blocked {
+                    self.notifications.pending_bell = true;
+                }
+                if self.notifications.desktop_notifications && not_muted_or_blocked {
+                    let notif_body = msg.body.as_deref().unwrap_or("");
+                    let notif_group = if is_group {
+                        self.store
+                            .conversations
+                            .get(&conv_id)
+                            .map(|c| c.name.clone())
+                    } else {
+                        None
+                    };
+                    show_desktop_notification(
+                        &sender_display,
+                        notif_body,
+                        is_group,
+                        notif_group.as_deref(),
+                        &self.notifications.notification_preview,
+                    );
+                }
             }
-            if self.notifications.desktop_notifications && not_muted_or_blocked {
-                let notif_body = msg.body.as_deref().unwrap_or("");
-                let notif_group = if is_group {
-                    self.store
-                        .conversations
-                        .get(&conv_id)
-                        .map(|c| c.name.clone())
-                } else {
-                    None
-                };
-                show_desktop_notification(
-                    &sender_display,
-                    notif_body,
-                    is_group,
-                    notif_group.as_deref(),
-                    &self.notifications.notification_preview,
-                );
-            }
+        }
+
+        // Viewport stabilization: keep scroll offset pinned during sync so newly
+        // arriving messages don't jump the viewport.
+        if self.sync.active
+            && !self.sync.user_scrolled
+            && self.active_conversation.as_ref() == Some(&conv_id)
+        {
+            self.scroll_offset = self.scroll_offset.saturating_add(1);
         }
 
         // Active conversation: send read receipt and advance read marker
@@ -4452,13 +4616,18 @@ impl App {
             .map(|c| c.accepted)
             .unwrap_or(true);
         if is_active {
-            if !msg.is_outgoing && conv_accepted && !self.blocked_conversations.contains(&conv_id) {
-                self.queue_single_read_receipt(&sender_id, msg_ts_ms);
-            }
-            if let Some(conv) = self.store.conversations.get(&conv_id) {
-                self.store
-                    .last_read_index
-                    .insert(conv_id.clone(), conv.messages.len());
+            if !self.sync.active {
+                if !msg.is_outgoing
+                    && conv_accepted
+                    && !self.blocked_conversations.contains(&conv_id)
+                {
+                    self.queue_single_read_receipt(&sender_id, msg_ts_ms);
+                }
+                if let Some(conv) = self.store.conversations.get(&conv_id) {
+                    self.store
+                        .last_read_index
+                        .insert(conv_id.clone(), conv.messages.len());
+                }
             }
             if let Ok(Some(rowid)) = self.db.last_message_rowid(&conv_id) {
                 db_warn(
@@ -4508,6 +4677,8 @@ impl App {
                     reactions: Vec::new(),
                     mention_ranges: Vec::new(),
                     style_ranges: Vec::new(),
+                    body_raw: None,
+                    mentions: Vec::new(),
                     quote: None,
                     is_edited: false,
                     is_deleted: false,
@@ -5048,15 +5219,11 @@ impl App {
 
         // Navigation mode
         match code {
-            KeyCode::Char('j') | KeyCode::Down => {
-                if self.profile.index < SAVE_INDEX {
-                    self.profile.index += 1;
-                }
+            KeyCode::Char('j') | KeyCode::Down if self.profile.index < SAVE_INDEX => {
+                self.profile.index += 1;
             }
-            KeyCode::Char('k') | KeyCode::Up => {
-                if self.profile.index > 0 {
-                    self.profile.index -= 1;
-                }
+            KeyCode::Char('k') | KeyCode::Up if self.profile.index > 0 => {
+                self.profile.index -= 1;
             }
             KeyCode::Enter => {
                 if self.profile.index < FIELD_COUNT {
@@ -5294,6 +5461,10 @@ impl App {
         // Re-resolve reaction senders: DB stores phone numbers but display
         // needs contact names (or "you" for own reactions).
         self.store.resolve_stored_names(&self.account);
+
+        // Re-resolve @mention display bodies: messages that arrived before the
+        // contact list may have fallen back to truncated UUIDs. (#283)
+        self.store.rebuild_mention_display(&self.db);
     }
 
     fn handle_group_list(&mut self, groups: Vec<Group>) {
@@ -5338,6 +5509,10 @@ impl App {
         }
         // Re-resolve reaction senders with any new names from group members.
         self.store.resolve_stored_names(&self.account);
+
+        // Re-resolve @mention display bodies: group member names may now fill
+        // in UUIDs that weren't known at message-receipt time. (#283)
+        self.store.rebuild_mention_display(&self.db);
     }
 
     fn handle_identity_list(&mut self, identities: Vec<IdentityInfo>) {
@@ -5410,7 +5585,7 @@ impl App {
                 }
             }
         }
-        found.sort_by(|a, b| b.0.cmp(&a.0)); // reverse order
+        found.sort_by_key(|b| std::cmp::Reverse(b.0)); // reverse order
 
         for (byte_start, byte_end, uuid) in &found {
             // Compute UTF-16 offset before replacement
@@ -5771,6 +5946,19 @@ impl App {
                             reactions: Vec::new(),
                             mention_ranges,
                             style_ranges: Vec::new(),
+                            body_raw: if wire_mentions.is_empty() {
+                                None
+                            } else {
+                                Some(wire_body.clone())
+                            },
+                            mentions: wire_mentions
+                                .iter()
+                                .map(|(start, uuid)| Mention {
+                                    start: *start,
+                                    length: 1,
+                                    uuid: uuid.clone(),
+                                })
+                                .collect(),
                             quote,
                             is_edited: false,
                             is_deleted: false,
@@ -6171,6 +6359,8 @@ impl App {
                             reactions: Vec::new(),
                             mention_ranges: Vec::new(),
                             style_ranges: Vec::new(),
+                            body_raw: None,
+                            mentions: Vec::new(),
                             quote: None,
                             is_edited: false,
                             is_deleted: false,
@@ -6318,7 +6508,7 @@ impl App {
                 }
             }
 
-            candidates.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+            candidates.sort_by_key(|a| a.0.to_lowercase());
 
             if !candidates.is_empty() {
                 self.autocomplete.visible = true;
@@ -6374,7 +6564,7 @@ impl App {
                             candidates.push((conv_id.clone(), name, uuid));
                         }
                     }
-                    candidates.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+                    candidates.sort_by_key(|a| a.1.to_lowercase());
 
                     if !candidates.is_empty() {
                         self.autocomplete.visible = true;
@@ -7092,17 +7282,19 @@ impl App {
             MouseEventKind::Down(MouseButton::Left) => {
                 self.handle_left_click(event.column, event.row);
             }
-            MouseEventKind::ScrollUp => {
-                if is_in_rect(event.column, event.row, self.mouse_messages_area) {
-                    self.scroll_offset = self.scroll_offset.saturating_add(3);
-                    self.focused_msg_index = None;
-                }
+            MouseEventKind::ScrollUp
+                if is_in_rect(event.column, event.row, self.mouse_messages_area) =>
+            {
+                self.sync.user_scrolled = true;
+                self.scroll_offset = self.scroll_offset.saturating_add(3);
+                self.focused_msg_index = None;
             }
-            MouseEventKind::ScrollDown => {
-                if is_in_rect(event.column, event.row, self.mouse_messages_area) {
-                    self.scroll_offset = self.scroll_offset.saturating_sub(3);
-                    self.focused_msg_index = None;
-                }
+            MouseEventKind::ScrollDown
+                if is_in_rect(event.column, event.row, self.mouse_messages_area) =>
+            {
+                self.sync.user_scrolled = true;
+                self.scroll_offset = self.scroll_offset.saturating_sub(3);
+                self.focused_msg_index = None;
             }
             _ => {}
         }
@@ -7387,6 +7579,8 @@ impl App {
                 reactions: Vec::new(),
                 mention_ranges: Vec::new(),
                 style_ranges: Vec::new(),
+                body_raw: None,
+                mentions: Vec::new(),
                 quote: None,
                 is_edited: false,
                 is_deleted: false,
@@ -8838,6 +9032,8 @@ mod tests {
                 reactions: Vec::new(),
                 mention_ranges: Vec::new(),
                 style_ranges: Vec::new(),
+                body_raw: None,
+                mentions: Vec::new(),
                 quote: None,
                 is_edited: false,
                 is_deleted: false,
@@ -8895,6 +9091,8 @@ mod tests {
                 reactions: Vec::new(),
                 mention_ranges: Vec::new(),
                 style_ranges: Vec::new(),
+                body_raw: None,
+                mentions: Vec::new(),
                 quote: None,
                 is_edited: false,
                 is_deleted: false,
@@ -8943,6 +9141,8 @@ mod tests {
                 reactions: Vec::new(),
                 mention_ranges: Vec::new(),
                 style_ranges: Vec::new(),
+                body_raw: None,
+                mentions: Vec::new(),
                 quote: None,
                 is_edited: false,
                 is_deleted: false,
@@ -8992,6 +9192,8 @@ mod tests {
                 reactions: Vec::new(),
                 mention_ranges: Vec::new(),
                 style_ranges: Vec::new(),
+                body_raw: None,
+                mentions: Vec::new(),
                 quote: None,
                 is_edited: false,
                 is_deleted: false,
@@ -9158,6 +9360,8 @@ mod tests {
                 reactions: Vec::new(),
                 mention_ranges: Vec::new(),
                 style_ranges: Vec::new(),
+                body_raw: None,
+                mentions: Vec::new(),
                 quote: None,
                 is_edited: false,
                 is_deleted: false,
@@ -9361,6 +9565,8 @@ mod tests {
                 reactions: Vec::new(),
                 mention_ranges: Vec::new(),
                 style_ranges: Vec::new(),
+                body_raw: None,
+                mentions: Vec::new(),
                 quote: None,
                 is_edited: false,
                 is_deleted: false,
@@ -9435,6 +9641,8 @@ mod tests {
             reactions: Vec::new(),
             mention_ranges: Vec::new(),
             style_ranges: Vec::new(),
+            body_raw: None,
+            mentions: Vec::new(),
             quote: None,
             is_edited: false,
             is_deleted: false,
@@ -9473,6 +9681,8 @@ mod tests {
             ],
             mention_ranges: Vec::new(),
             style_ranges: Vec::new(),
+            body_raw: None,
+            mentions: Vec::new(),
             // Quote from own account (should become "you")
             quote: Some(Quote {
                 author: "+10000000000".to_string(),
@@ -9505,6 +9715,8 @@ mod tests {
             reactions: Vec::new(),
             mention_ranges: Vec::new(),
             style_ranges: Vec::new(),
+            body_raw: None,
+            mentions: Vec::new(),
             quote: Some(Quote {
                 author: "+3".to_string(),
                 body: "hey".to_string(),
@@ -9590,6 +9802,54 @@ mod tests {
         for (range, tag) in ranges.iter().zip(expected_tags.iter()) {
             assert_eq!(&resolved[range.0..range.1], *tag);
         }
+    }
+
+    #[rstest]
+    fn mention_reresolves_when_contact_arrives_after_message(mut app: App) {
+        // Regression test for #283: message with mention arrives before
+        // contact list is processed, so the mention initially falls back
+        // to a truncated UUID. When the contact list arrives, the mention
+        // should update to the real name.
+        let msg = SignalMessage {
+            source: "+15550001111".to_string(),
+            source_name: None,
+            source_uuid: Some("aaaaaaaa-1111-1111-1111-111111111111".to_string()),
+            timestamp: chrono::Utc::now(),
+            body: Some("hi \u{FFFC} welcome".to_string()),
+            attachments: vec![],
+            group_id: None,
+            group_name: None,
+            is_outgoing: false,
+            destination: None,
+            mentions: vec![Mention {
+                start: 3,
+                length: 1,
+                uuid: "bbbbbbbb-2222-2222-2222-222222222222".to_string(),
+            }],
+            text_styles: vec![],
+            quote: None,
+            expires_in_seconds: 0,
+            previews: Vec::new(),
+        };
+        app.handle_signal_event(SignalEvent::MessageReceived(msg));
+
+        // Initial resolution falls back to truncated UUID.
+        let body = &app.store.conversations["+15550001111"].messages[0].body;
+        assert!(
+            body.contains("@bbbbbbbb"),
+            "expected truncated UUID fallback, got {body:?}"
+        );
+
+        // Contact list arrives with the mentioned user.
+        app.handle_signal_event(SignalEvent::ContactList(vec![Contact {
+            number: "+15550002222".to_string(),
+            name: Some("Bob".to_string()),
+            uuid: Some("bbbbbbbb-2222-2222-2222-222222222222".to_string()),
+        }]));
+
+        // Mention should now resolve to the real name.
+        let body = &app.store.conversations["+15550001111"].messages[0].body;
+        assert_eq!(body, "hi @Bob welcome");
     }
 
     #[rstest]
@@ -9926,6 +10186,8 @@ mod tests {
 
     #[rstest]
     fn unread_bar_clears_on_active_incoming_message(mut app: App) {
+        app.sync.active = false;
+
         // Deliver a message while conversation is NOT active → creates unread
         let msg1 = SignalMessage {
             source: "+15551234567".to_string(),
@@ -11028,6 +11290,7 @@ mod tests {
 
     #[rstest]
     fn bell_rings_for_background_dm(mut app: App) {
+        app.sync.active = false;
         // "+1" must be a known contact so conversation is accepted
         app.store
             .contact_names
@@ -11068,6 +11331,7 @@ mod tests {
 
     #[rstest]
     fn bell_for_group_respects_setting(mut app: App) {
+        app.sync.active = false;
         app.handle_signal_event(SignalEvent::GroupList(vec![Group {
             id: "g1".to_string(),
             name: "Team".to_string(),
@@ -11117,6 +11381,7 @@ mod tests {
 
     #[rstest]
     fn active_conv_queues_read_receipt(mut app: App) {
+        app.sync.active = false;
         app.store
             .get_or_create_conversation("+1", "Alice", false, &app.db);
         app.active_conversation = Some("+1".to_string());
@@ -11531,5 +11796,145 @@ mod tests {
             items.iter().any(|a| a.label == "Open link"),
             "focused msg has URL, should show Open link"
         );
+    }
+
+    // --- SyncState tests ---
+
+    #[rstest]
+    fn sync_starts_active(app: App) {
+        assert!(app.sync.active);
+        assert_eq!(app.sync.message_count, 0);
+        assert!(!app.sync.user_scrolled);
+    }
+
+    #[rstest]
+    fn sync_should_end_requires_quiet_and_min_elapsed(mut app: App) {
+        assert!(!app.sync.should_end());
+        app.sync.started_at = Instant::now() - std::time::Duration::from_secs(15);
+        assert!(app.sync.should_end());
+        app.sync.last_message_time = Some(Instant::now());
+        assert!(!app.sync.should_end());
+        app.sync.last_message_time = Some(Instant::now() - std::time::Duration::from_secs(5));
+        assert!(app.sync.should_end());
+    }
+
+    #[rstest]
+    fn sync_suppresses_notifications(mut app: App) {
+        assert!(app.sync.active);
+        app.store
+            .contact_names
+            .insert("+1".to_string(), "Alice".to_string());
+        app.store
+            .get_or_create_conversation("+other", "Other", false, &app.db);
+        app.active_conversation = Some("+other".to_string());
+        app.notifications.notify_direct = true;
+        let msg = make_msg("+1", Some("hello"), None, false);
+        app.handle_signal_event(SignalEvent::MessageReceived(msg));
+        assert!(!app.notifications.pending_bell);
+        assert_eq!(
+            app.sync
+                .suppressed_notifications
+                .get("+1")
+                .copied()
+                .unwrap_or(0),
+            1
+        );
+        assert!(app.sync.message_count > 0);
+    }
+
+    #[rstest]
+    fn notifications_fire_after_sync_ends(mut app: App) {
+        app.sync.active = false;
+        app.store
+            .contact_names
+            .insert("+1".to_string(), "Alice".to_string());
+        app.store
+            .get_or_create_conversation("+other", "Other", false, &app.db);
+        app.active_conversation = Some("+other".to_string());
+        app.notifications.notify_direct = true;
+        let msg = make_msg("+1", Some("hello"), None, false);
+        app.handle_signal_event(SignalEvent::MessageReceived(msg));
+        assert!(app.notifications.pending_bell);
+    }
+
+    #[rstest]
+    fn sync_stabilizes_scroll_offset(mut app: App) {
+        assert!(app.sync.active);
+        app.store
+            .get_or_create_conversation("+1", "Alice", false, &app.db);
+        app.active_conversation = Some("+1".to_string());
+        app.scroll_offset = 0;
+        let msg = make_msg("+1", Some("hello from sync"), None, false);
+        app.handle_signal_event(SignalEvent::MessageReceived(msg));
+        assert!(
+            app.scroll_offset > 0,
+            "scroll_offset should increase during sync"
+        );
+    }
+
+    #[rstest]
+    fn sync_does_not_stabilize_after_user_scroll(mut app: App) {
+        assert!(app.sync.active);
+        app.store
+            .get_or_create_conversation("+1", "Alice", false, &app.db);
+        app.active_conversation = Some("+1".to_string());
+        app.scroll_offset = 0;
+        app.sync.user_scrolled = true;
+        let msg = make_msg("+1", Some("hello"), None, false);
+        app.handle_signal_event(SignalEvent::MessageReceived(msg));
+        assert_eq!(app.scroll_offset, 0);
+    }
+
+    #[rstest]
+    fn sync_does_not_advance_read_index_for_active_conv(mut app: App) {
+        assert!(app.sync.active);
+        app.store
+            .get_or_create_conversation("+1", "Alice", false, &app.db);
+        app.active_conversation = Some("+1".to_string());
+        let initial_read = app.store.last_read_index.get("+1").copied().unwrap_or(0);
+        let msg = make_msg("+1", Some("hello"), None, false);
+        app.handle_signal_event(SignalEvent::MessageReceived(msg));
+        let after_read = app.store.last_read_index.get("+1").copied().unwrap_or(0);
+        assert_eq!(
+            initial_read, after_read,
+            "read index should not advance during sync"
+        );
+    }
+
+    #[rstest]
+    fn end_sync_snaps_to_bottom_and_fires_bell(mut app: App) {
+        app.sync.active = true;
+        app.sync.message_count = 50;
+        app.scroll_offset = 30;
+        app.sync
+            .suppressed_notifications
+            .insert("+1".to_string(), 10);
+        app.sync
+            .suppressed_notifications
+            .insert("+2".to_string(), 5);
+        app.end_sync();
+        assert!(!app.sync.active);
+        assert_eq!(app.scroll_offset, 0);
+        assert!(app.notifications.pending_bell);
+        assert!(app.sync.suppressed_notifications.is_empty());
+    }
+
+    #[rstest]
+    fn end_sync_respects_user_scroll(mut app: App) {
+        app.sync.active = true;
+        app.scroll_offset = 15;
+        app.sync.user_scrolled = true;
+        app.end_sync();
+        assert!(!app.sync.active);
+        assert_eq!(app.scroll_offset, 15);
+    }
+
+    #[rstest]
+    fn end_sync_no_bell_when_no_suppressed(mut app: App) {
+        app.sync.active = true;
+        app.sync.message_count = 5;
+        app.end_sync();
+        assert!(!app.sync.active);
+        assert!(!app.notifications.pending_bell);
     }
 }

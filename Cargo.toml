@@ -1,6 +1,6 @@
 [package]
 name = "siggy"
-version = "1.6.0"
+version = "1.7.1"
 edition = "2021"
 license = "GPL-3.0-only"
 description = "Terminal-based Signal messenger client with vim keybindings"
@@ -9,7 +9,7 @@ keywords = ["signal", "tui", "terminal", "messenger", "ratatui"]
 categories = ["command-line-utilities"]
 
 [dependencies]
-ratatui = "0.30"
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 crossterm = "0.29"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
