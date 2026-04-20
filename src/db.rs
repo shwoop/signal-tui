@@ -232,20 +232,21 @@ impl Database {
             self.conn.execute_batch(
                 "
                 BEGIN;
-                ALTER TABLE conversations ADD COLUMN mute_expires_at TEXT;
-                UPDATE schema_version SET version = 13;
+                ALTER TABLE messages ADD COLUMN body_raw TEXT;
+                ALTER TABLE messages ADD COLUMN mentions_json TEXT;
+                UPDATE schema_version SET version = 14;
                 COMMIT;
                 ",
             )?;
+
         }
 
         if version < 14 {
             self.conn.execute_batch(
                 "
                 BEGIN;
-                ALTER TABLE messages ADD COLUMN body_raw TEXT;
-                ALTER TABLE messages ADD COLUMN mentions_json TEXT;
-                UPDATE schema_version SET version = 14;
+                ALTER TABLE conversations ADD COLUMN mute_expires_at TEXT;
+                UPDATE schema_version SET version = 13;
                 COMMIT;
                 ",
             )?;
