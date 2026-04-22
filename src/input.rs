@@ -41,8 +41,8 @@ pub const COMMANDS: &[CommandInfo] = &[
     CommandInfo {
         name: "/mute",
         alias: "",
-        args: "",
-        description: "Mute/unmute current chat",
+        args: "[duration]",
+        description: "Mute/unmute (e.g. 1h, 8h, 1d, 1w)",
     },
     CommandInfo {
         name: "/block",
@@ -175,8 +175,8 @@ pub enum InputAction {
     ToggleSidebar,
     /// Toggle terminal bell notifications (None = both, Some("direct"/"group") = specific)
     ToggleBell(Option<String>),
-    /// Mute/unmute the current conversation
-    ToggleMute,
+    /// Mute/unmute the current conversation (None = toggle permanent, Some = timed)
+    Mute(Option<String>),
     /// Block the current contact/group
     Block,
     /// Unblock the current contact/group
@@ -258,7 +258,13 @@ pub fn parse_input(input: &str) -> InputAction {
                 InputAction::ToggleBell(Some(arg))
             }
         }
-        "/mute" => InputAction::ToggleMute,
+        "/mute" => {
+            if arg.is_empty() {
+                InputAction::Mute(None)
+            } else {
+                InputAction::Mute(Some(arg))
+            }
+        }
         "/block" => InputAction::Block,
         "/unblock" => InputAction::Unblock,
         "/attach" | "/a" => InputAction::Attach,
@@ -407,8 +413,27 @@ pub fn parse_duration_to_seconds(s: &str) -> Result<i64, String> {
         return Err(format!("Invalid duration: {s}. Use off/30s/5m/1h/1d/1w/4w"));
     };
     match num_str.parse::<i64>() {
-        Ok(n) if n > 0 => Ok(n * multiplier),
+        Ok(n) if n > 0 => n
+            .checked_mul(multiplier)
+            .ok_or_else(|| format!("Duration too large: {s}")),
         _ => Err(format!("Invalid duration: {s}. Use off/30s/5m/1h/1d/1w/4w")),
+    }
+}
+
+/// Format remaining mute time compactly for sidebar display.
+/// Uses the largest unit that yields a value >= 1: `~Nw`, `~Nd`, `~Nh`, `~Nm`.
+/// For less than 60 seconds returns `~<1m`.
+pub fn format_mute_remaining(seconds: i64) -> String {
+    if seconds < 60 {
+        "~<1m".to_string()
+    } else if seconds < 3600 {
+        format!("~{}m", seconds / 60)
+    } else if seconds < 86400 {
+        format!("~{}h", seconds / 3600)
+    } else if seconds < 604800 {
+        format!("~{}d", seconds / 86400)
+    } else {
+        format!("~{}w", seconds / 604800)
     }
 }
 
@@ -459,7 +484,7 @@ mod tests {
     #[case("/q", InputAction::Quit)]
     #[case("/sidebar", InputAction::ToggleSidebar)]
     #[case("/sb", InputAction::ToggleSidebar)]
-    #[case("/mute", InputAction::ToggleMute)]
+    #[case("/mute", InputAction::Mute(None))]
     #[case("/settings", InputAction::Settings)]
     #[case("/attach", InputAction::Attach)]
     #[case("/a", InputAction::Attach)]
@@ -497,6 +522,8 @@ mod tests {
     #[case("/dm off", InputAction::SetDisappearing("off".to_string()))]
     #[case("/bell direct", InputAction::ToggleBell(Some("direct".to_string())))]
     #[case("/notify group", InputAction::ToggleBell(Some("group".to_string())))]
+    #[case("/mute 2h", InputAction::Mute(Some("2h".to_string())))]
+    #[case("/mute 1d", InputAction::Mute(Some("1d".to_string())))]
     #[case("/emoji smile", InputAction::Emoji("smile".to_string()))]
     #[case("/e rocket", InputAction::Emoji("rocket".to_string()))]
     fn command_with_argument(#[case] input: &str, #[case] expected: InputAction) {
@@ -571,6 +598,25 @@ mod tests {
             parse_duration_to_seconds(input).is_err(),
             "expected error for {input:?}"
         );
+    }
+
+    // --- Mute remaining formatter ---
+
+    #[rstest]
+    #[case(30, "~<1m")]
+    #[case(59, "~<1m")]
+    #[case(60, "~1m")]
+    #[case(90, "~1m")]
+    #[case(3599, "~59m")]
+    #[case(3600, "~1h")]
+    #[case(5400, "~1h")]
+    #[case(7200, "~2h")]
+    #[case(86400, "~1d")]
+    #[case(172800, "~2d")]
+    #[case(604800, "~1w")]
+    #[case(1209600, "~2w")]
+    fn format_mute_remaining_cases(#[case] seconds: i64, #[case] expected: &str) {
+        assert_eq!(format_mute_remaining(seconds), expected);
     }
 
     // --- Poll command ---

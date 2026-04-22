@@ -752,6 +752,7 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
             .collect()
     };
 
+    let now = chrono::Utc::now();
     let items: Vec<ListItem> = display_order
         .iter()
         .map(|id| {
@@ -794,12 +795,12 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
             }
 
             // Conversation name
-            let is_muted = app.muted_conversations.contains(id);
+            let mute_state = app.active_mute(id, now);
             let name_style = if is_active {
                 Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)
             } else if has_unread {
                 Style::default().fg(theme.warning)
-            } else if is_muted {
+            } else if mute_state.is_some() {
                 Style::default().fg(theme.fg_muted)
             } else {
                 Style::default().fg(theme.fg_secondary)
@@ -813,8 +814,8 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
                 ));
             }
 
-            if is_muted {
-                spans.push(Span::styled(" ~", Style::default().fg(theme.fg_muted)));
+            if let Some(indicator) = mute_state.and_then(|m| m.sidebar_indicator(now)) {
+                spans.push(Span::styled(indicator, Style::default().fg(theme.fg_muted)));
             }
             if app.blocked_conversations.contains(id) {
                 spans.push(Span::styled(" x", Style::default().fg(theme.error)));
@@ -924,6 +925,18 @@ fn draw_messages(frame: &mut Frame, app: &mut App, area: Rect) {
                     }
                     TrustLevel::TrustedUnverified => {} // normal state, no indicator
                 }
+            }
+
+            // Mute indicator
+            let now = chrono::Utc::now();
+            if let Some(indicator) = app
+                .active_mute(id, now)
+                .and_then(|m| m.sidebar_indicator(now))
+            {
+                spans.push(Span::styled(
+                    format!("{} ", indicator.trim_start()),
+                    Style::default().fg(theme.fg_muted),
+                ));
             }
 
             // Scroll indicator in title

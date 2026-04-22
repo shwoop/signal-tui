@@ -11,9 +11,11 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use rusqlite::{Connection, params};
 
 use crate::app::{Conversation, DisplayMessage};
+use crate::mute::MuteState;
 use crate::signal::types::{LinkPreview, Mention, MessageStatus, PollData, PollVote, Reaction};
 
 /// (sender, body, timestamp_ms, conversation_id, conversation_name)
@@ -242,6 +244,17 @@ impl Database {
                 ALTER TABLE messages ADD COLUMN body_raw TEXT;
                 ALTER TABLE messages ADD COLUMN mentions_json TEXT;
                 UPDATE schema_version SET version = 13;
+                COMMIT;
+                ",
+            )?;
+        }
+
+        if version < 14 {
+            self.conn.execute_batch(
+                "
+                BEGIN;
+                ALTER TABLE conversations ADD COLUMN mute_expires_at TEXT;
+                UPDATE schema_version SET version = 14;
                 COMMIT;
                 ",
             )?;
@@ -814,22 +827,54 @@ impl Database {
 
     // --- Muted conversations ---
 
-    pub fn set_muted(&self, conv_id: &str, muted: bool) -> Result<()> {
+    /// Persist a mute state. `None` unmutes the conversation.
+    pub fn set_mute(&self, conv_id: &str, state: Option<MuteState>) -> Result<()> {
+        let (muted, expires_str) = match state {
+            None => (0, None),
+            Some(MuteState::Permanent) => (1, None),
+            Some(MuteState::Until(t)) => (1, Some(t.to_rfc3339())),
+        };
         self.conn.execute(
-            "UPDATE conversations SET muted = ?2 WHERE id = ?1",
-            params![conv_id, muted as i32],
+            "UPDATE conversations SET muted = ?2, mute_expires_at = ?3 WHERE id = ?1",
+            params![conv_id, muted, expires_str],
         )?;
         Ok(())
     }
 
-    pub fn load_muted(&self) -> Result<std::collections::HashSet<String>> {
+    pub fn load_mutes(&self) -> Result<HashMap<String, MuteState>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id FROM conversations WHERE muted = 1")?;
-        let ids: Vec<String> = stmt
-            .query_map([], |row| row.get(0))?
+            .prepare("SELECT id, mute_expires_at FROM conversations WHERE muted = 1")?;
+        let rows = stmt
+            .query_map([], |row| {
+                let id: String = row.get(0)?;
+                let expires: Option<String> = row.get(1)?;
+                Ok((id, expires))
+            })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(ids.into_iter().collect())
+        let mut map = HashMap::new();
+        for (id, expires_str) in rows {
+            let state = match expires_str.and_then(|s| DateTime::parse_from_rfc3339(&s).ok()) {
+                Some(dt) => MuteState::Until(dt.with_timezone(&Utc)),
+                None => MuteState::Permanent,
+            };
+            map.insert(id, state);
+        }
+        Ok(map)
+    }
+
+    /// Clear mutes whose expiry has passed. Returns the conversation IDs that were unmuted.
+    pub fn clear_expired_mutes(&self, now: DateTime<Utc>) -> Result<Vec<String>> {
+        let now_str = now.to_rfc3339();
+        let mut stmt = self.conn.prepare(
+            "UPDATE conversations SET muted = 0, mute_expires_at = NULL
+             WHERE muted = 1 AND mute_expires_at IS NOT NULL AND mute_expires_at <= ?1
+             RETURNING id",
+        )?;
+        let ids = stmt
+            .query_map(params![now_str], |row| row.get(0))?
+            .collect::<std::result::Result<Vec<String>, _>>()?;
+        Ok(ids)
     }
 
     // --- Blocked conversations ---
@@ -1136,34 +1181,86 @@ mod tests {
         assert_eq!(order[1], "+1");
     }
 
-    // --- Boolean flag round-trips: muted + blocked share identical structure ---
+    // --- Boolean flag round-trip: blocked ---
 
     #[rstest]
-    #[case("muted",
-        Database::set_muted as fn(&Database, &str, bool) -> anyhow::Result<()>,
-        Database::load_muted as fn(&Database) -> anyhow::Result<std::collections::HashSet<String>>
-    )]
-    #[case("blocked",
-        Database::set_blocked as fn(&Database, &str, bool) -> anyhow::Result<()>,
-        Database::load_blocked as fn(&Database) -> anyhow::Result<std::collections::HashSet<String>>
-    )]
-    fn boolean_flag_round_trip(
-        db: Database,
-        #[case] _label: &str,
-        #[case] setter: fn(&Database, &str, bool) -> anyhow::Result<()>,
-        #[case] loader: fn(&Database) -> anyhow::Result<std::collections::HashSet<String>>,
-    ) {
+    fn blocked_flag_round_trip(db: Database) {
         db.upsert_conversation("+1", "Alice", false).unwrap();
         db.upsert_conversation("+2", "Bob", false).unwrap();
 
-        setter(&db, "+1", true).unwrap();
-        let set = loader(&db).unwrap();
+        db.set_blocked("+1", true).unwrap();
+        let set = db.load_blocked().unwrap();
         assert!(set.contains("+1"));
         assert!(!set.contains("+2"));
 
-        setter(&db, "+1", false).unwrap();
-        let set = loader(&db).unwrap();
+        db.set_blocked("+1", false).unwrap();
+        let set = db.load_blocked().unwrap();
         assert!(!set.contains("+1"));
+    }
+
+    // --- Muted flag round-trips ---
+
+    #[rstest]
+    fn permanent_mute_round_trip(db: Database) {
+        db.upsert_conversation("+1", "Alice", false).unwrap();
+        db.upsert_conversation("+2", "Bob", false).unwrap();
+
+        db.set_mute("+1", Some(MuteState::Permanent)).unwrap();
+        let map = db.load_mutes().unwrap();
+        assert_eq!(map.get("+1"), Some(&MuteState::Permanent));
+        assert!(!map.contains_key("+2"));
+
+        db.set_mute("+1", None).unwrap();
+        let map = db.load_mutes().unwrap();
+        assert!(!map.contains_key("+1"));
+    }
+
+    #[rstest]
+    fn timed_mute_round_trip(db: Database) {
+        use chrono::TimeZone;
+        db.upsert_conversation("+1", "Alice", false).unwrap();
+
+        let expiry = Utc.with_ymd_and_hms(2026, 6, 15, 12, 0, 0).unwrap();
+        db.set_mute("+1", Some(MuteState::Until(expiry))).unwrap();
+        let map = db.load_mutes().unwrap();
+        assert_eq!(map["+1"], MuteState::Until(expiry));
+    }
+
+    #[rstest]
+    fn clear_expired_mutes_clears_past(db: Database) {
+        use chrono::TimeZone;
+        db.upsert_conversation("+1", "Alice", false).unwrap();
+        db.upsert_conversation("+2", "Bob", false).unwrap();
+
+        let past = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let future = Utc.with_ymd_and_hms(2099, 1, 1, 0, 0, 0).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
+
+        // +1 has expired timed mute, +2 has future timed mute
+        db.set_mute("+1", Some(MuteState::Until(past))).unwrap();
+        db.set_mute("+2", Some(MuteState::Until(future))).unwrap();
+
+        let cleared = db.clear_expired_mutes(now).unwrap();
+        assert_eq!(cleared, vec!["+1"]);
+
+        let map = db.load_mutes().unwrap();
+        assert!(!map.contains_key("+1")); // cleared
+        assert!(map.contains_key("+2")); // still muted
+    }
+
+    #[rstest]
+    fn clear_expired_mutes_skips_permanent(db: Database) {
+        use chrono::TimeZone;
+        db.upsert_conversation("+1", "Alice", false).unwrap();
+
+        db.set_mute("+1", Some(MuteState::Permanent)).unwrap();
+
+        let now = Utc.with_ymd_and_hms(2099, 1, 1, 0, 0, 0).unwrap();
+        let cleared = db.clear_expired_mutes(now).unwrap();
+        assert!(cleared.is_empty());
+
+        let map = db.load_mutes().unwrap();
+        assert!(map.contains_key("+1")); // still muted
     }
 
     #[rstest]
