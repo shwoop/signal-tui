@@ -244,9 +244,13 @@ fn show_desktop_notification(
     });
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputMode {
+    Normal,
+    Insert,
+}
+
 /// Tag identifying which overlay is currently active.
-///
-/// Stored on `App.current_overlay` as the single source of truth for overlay
 /// visibility. Adding a new overlay requires adding a variant here and
 /// handling it in `App::handle_overlay_key`, which the compiler enforces
 /// via the exhaustive match.
@@ -304,58 +308,6 @@ pub struct ImageRenderResult {
     pub pre_sixel: Option<(String, String)>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ActionMenuHint {
-    Reply,
-    Edit,
-    React,
-    Forward,
-    Copy,
-    Delete,
-    PinToggle,
-    Vote,
-    EndPoll,
-    OpenAttachment,
-    OpenLink,
-}
-
-impl ActionMenuHint {
-    /// Maps a single character to its corresponding menu hint.
-    pub fn from_char(c: char) -> Option<Self> {
-        match c {
-            'q' => Some(Self::Reply),
-            'e' => Some(Self::Edit),
-            'r' => Some(Self::React),
-            'f' => Some(Self::Forward),
-            'y' => Some(Self::Copy),
-            'd' => Some(Self::Delete),
-            'p' => Some(Self::PinToggle),
-            'v' => Some(Self::Vote),
-            'x' => Some(Self::EndPoll),
-            'o' => Some(Self::OpenAttachment),
-            'l' => Some(Self::OpenLink),
-            _ => None,
-        }
-    }
-
-    /// Returns the single-character string used for UI display.
-    pub fn key_label(self) -> &'static str {
-        match self {
-            Self::Reply => "q",
-            Self::Edit => "e",
-            Self::React => "r",
-            Self::Forward => "f",
-            Self::Copy => "y",
-            Self::Delete => "d",
-            Self::PinToggle => "p",
-            Self::Vote => "v",
-            Self::EndPoll => "x",
-            Self::OpenAttachment => "o",
-            Self::OpenLink => "l",
-        }
-    }
-}
-
 /// Which sub-overlay of the /group menu is currently active.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GroupMenuState {
@@ -371,7 +323,7 @@ pub enum GroupMenuState {
 /// An action available in the message action menu.
 pub struct MenuAction {
     pub label: &'static str,
-    pub key_hint: ActionMenuHint,
+    pub key_hint: &'static str,
     pub nerd_icon: &'static str,
 }
 
